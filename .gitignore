@@ -39,3 +39,13 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# vendor assets synced by scripts/copy-pdfjs-assets.mjs (postinstall/predev)
+/public/pdf.worker.min.mjs
+/public/cmaps/
+/public/standard_fonts/
+/public/tesseract/
+/public/tesseract-core/
+
+# tesseract.js language data (downloaded on demand; Node runs cache to repo root)
+*.traineddata
