@@ -15,15 +15,24 @@ export default function PdfTranslatorApp() {
   );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [manualGroups, setManualGroups] = useState<LineGroup[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dropError, setDropError] = useState<string | null>(null);
   const [, startTransition] = useTransition();
   const abortRef = useRef<AbortController | null>(null);
+  // 手動領域の翻訳は初回翻訳と独立して走らせるため、専用のコントローラで中断管理する。
+  const manualAbortRef = useRef<AbortController | null>(null);
   const failedCount = Object.values(translations).filter((t) => t.failed).length;
 
   const loadFile = useCallback(async (buffer: ArrayBuffer, name: string) => {
     abortRef.current?.abort();
+    manualAbortRef.current?.abort();
     setData(buffer);
     setFileName(name);
     setTranslations({});
+    setManualGroups([]);
+    setSelectionMode(false);
     setStatus("idle");
     setErrorMessage(null);
     setZoom(1);
@@ -37,14 +46,51 @@ export default function PdfTranslatorApp() {
   }, []);
   const zoomReset = useCallback(() => setZoom(1), []);
 
-  const handleFileInput = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
+  const loadPdfFile = useCallback(
+    async (file: File) => {
+      if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+        setDropError("PDFファイルを選択してください");
+        return;
+      }
+      setDropError(null);
       const buffer = await file.arrayBuffer();
       await loadFile(buffer, file.name);
     },
     [loadFile]
+  );
+
+  const handleFileInput = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      await loadPdfFile(file);
+      // 同じファイルを続けて選び直せるよう入力値をリセットする
+      e.target.value = "";
+    },
+    [loadPdfFile]
+  );
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    // 子要素間のenter/leaveで誤ってfalseにしないよう、コンテナ外に出たときだけ解除する
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+      const file = e.dataTransfer.files?.[0];
+      if (!file) return;
+      await loadPdfFile(file);
+    },
+    [loadPdfFile]
   );
 
   const handleExtracted = useCallback((groups: LineGroup[]) => {
@@ -71,6 +117,40 @@ export default function PdfTranslatorApp() {
           setErrorMessage(e instanceof Error ? e.message : String(e));
         }
       });
+  }, []);
+
+  const handleManualRegion = useCallback((group: LineGroup) => {
+    setManualGroups((prev) => [...prev, group]);
+    // 初回翻訳のコントローラを奪わないよう、手動領域は専用コントローラで翻訳する。
+    const controller = new AbortController();
+    manualAbortRef.current = controller;
+    translateGroups(
+      [group],
+      (partial) => {
+        startTransition(() => {
+          setTranslations((prev) => ({ ...prev, ...partial }));
+        });
+      },
+      controller.signal
+    ).catch((e) => {
+      // 手動領域の翻訳失敗は致命的ではないので、原文フォールバックのまま留める。
+      if (!controller.signal.aborted) {
+        console.error("手動領域の翻訳に失敗しました:", e);
+      }
+    });
+  }, []);
+
+  const clearManualRegions = useCallback(() => {
+    manualAbortRef.current?.abort();
+    setManualGroups([]);
+    // 手動グループぶんの翻訳結果（manual- 始まりのid）だけを取り除く。
+    setTranslations((prev) => {
+      const next: Record<string, TranslationEntry> = {};
+      for (const [id, entry] of Object.entries(prev)) {
+        if (!id.startsWith("manual-")) next[id] = entry;
+      }
+      return next;
+    });
   }, []);
 
   return (
@@ -152,6 +232,37 @@ export default function PdfTranslatorApp() {
         )}
 
         {data && (
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <button
+              type="button"
+              onClick={() => setSelectionMode((v) => !v)}
+              aria-pressed={selectionMode}
+              className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                selectionMode
+                  ? "bg-blue-600 text-white hover:bg-blue-700"
+                  : "border border-black/[.15] hover:bg-black/[.04] dark:border-white/[.15] dark:hover:bg-[#1a1a1a]"
+              }`}
+            >
+              {selectionMode ? "OCRエリア指定中（クリックで終了）" : "OCRエリア指定"}
+            </button>
+            {selectionMode && (
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                翻訳したい部分をドラッグで囲んでください
+              </span>
+            )}
+            {manualGroups.length > 0 && (
+              <button
+                type="button"
+                onClick={clearManualRegions}
+                className="rounded border border-black/[.15] px-2 py-1 text-xs hover:bg-black/[.04] dark:border-white/[.15] dark:hover:bg-[#1a1a1a]"
+              >
+                手動選択をクリア（{manualGroups.length}）
+              </button>
+            )}
+          </div>
+        )}
+
+        {data && (
           <div className="flex flex-wrap items-center gap-4 text-xs text-zinc-500 dark:text-zinc-400">
             <span className="flex items-center gap-1.5">
               <span className="inline-block h-3 w-3 border-[1.5px] border-solid border-[#2563eb] bg-[#dbeafe]" />
@@ -177,10 +288,30 @@ export default function PdfTranslatorApp() {
             showTranslation={showTranslation}
             zoom={zoom}
             onExtracted={handleExtracted}
+            selectionMode={selectionMode}
+            manualGroups={manualGroups}
+            onManualRegion={handleManualRegion}
           />
         ) : (
-          <div className="flex h-64 w-full max-w-3xl items-center justify-center rounded-lg border border-dashed border-black/[.15] text-sm text-zinc-500 dark:border-white/[.15] dark:text-zinc-400">
-            PDFをアップロードしてください
+          <div
+            onDrop={handleDrop}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            className={`flex h-64 w-full max-w-3xl flex-col items-center justify-center gap-1 rounded-lg border border-dashed text-sm transition-colors ${
+              isDragging
+                ? "border-blue-500 bg-blue-50 text-blue-700 dark:border-blue-400 dark:bg-blue-950/30 dark:text-blue-300"
+                : "border-black/[.15] text-zinc-500 dark:border-white/[.15] dark:text-zinc-400"
+            }`}
+          >
+            <span>
+              {isDragging
+                ? "ここにドロップして読み込み"
+                : "PDFをここにドラッグ＆ドロップ"}
+            </span>
+            <span className="text-xs">
+              または上の「PDFをアップロード」ボタンから選択
+            </span>
+            {dropError && <span className="text-xs text-red-600">{dropError}</span>}
           </div>
         )}
       </div>

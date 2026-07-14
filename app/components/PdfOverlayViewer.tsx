@@ -2,8 +2,8 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { groupTextItems, loadPdfjs } from "@/app/lib/pdf";
-import { runOcr } from "@/app/lib/ocr";
-import type { LineGroup, TranslationEntry } from "@/app/lib/types";
+import { runOcr, runOcrRegion } from "@/app/lib/ocr";
+import type { Box, LineGroup, TranslationEntry } from "@/app/lib/types";
 
 type Props = {
   /** 表示するPDFの生データ */
@@ -16,11 +16,49 @@ type Props = {
   zoom: number;
   /** 抽出したテキストグループを親へ通知（翻訳リクエストのトリガー用） */
   onExtracted: (groups: LineGroup[]) => void;
+  /** trueならマウスドラッグでOCR領域を追加指定できる */
+  selectionMode: boolean;
+  /** 手動指定で追加されたグループ（親が保持。描画用） */
+  manualGroups: LineGroup[];
+  /** 手動領域のOCRが成功したとき、生成した1グループを親へ通知 */
+  onManualRegion: (group: LineGroup) => void;
 };
 
 const SCALE = 1.5;
 // OCRは低解像度だと精度が大きく落ちるため、表示用よりも高い解像度で別途レンダリングする。
 const OCR_SCALE = 3;
+// 誤クリックを手動選択として扱わないための最小サイズ（表示座標px）。
+const MIN_SELECTION_PX = 8;
+
+// pdfjsのPDFPageProxyのうち、このコンポーネントで使う部分だけを構造的に表した型。
+// 型は動的importで得られるため、必要なメソッドのみを最小限で宣言する。
+type RenderablePage = {
+  getViewport(params: { scale: number }): { width: number; height: number };
+  render(params: {
+    canvas: HTMLCanvasElement;
+    canvasContext: CanvasRenderingContext2D;
+    viewport: { width: number; height: number };
+  }): { promise: Promise<void> };
+};
+
+type DragState = { startX: number; startY: number; curX: number; curY: number };
+
+function normalizeRect(d: DragState): Box {
+  return {
+    left: Math.min(d.startX, d.curX),
+    top: Math.min(d.startY, d.curY),
+    width: Math.abs(d.curX - d.startX),
+    height: Math.abs(d.curY - d.startY),
+    angle: 0,
+  };
+}
+
+// aの中心がbの矩形内に入っているか（表示座標）。
+function centerInside(a: Box, b: Box): boolean {
+  const cx = a.left + a.width / 2;
+  const cy = a.top + a.height / 2;
+  return cx >= b.left && cx <= b.left + b.width && cy >= b.top && cy <= b.top + b.height;
+}
 
 export default function PdfOverlayViewer({
   data,
@@ -28,12 +66,25 @@ export default function PdfOverlayViewer({
   showTranslation,
   zoom,
   onExtracted,
+  selectionMode,
+  manualGroups,
+  onManualRegion,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [groups, setGroups] = useState<LineGroup[]>([]);
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [error, setError] = useState<string | null>(null);
   const [ocrRunning, setOcrRunning] = useState(false);
+
+  // 手動OCR領域指定まわり
+  const pageRef = useRef<RenderablePage | null>(null);
+  // 手動選択のたびにフルページを高解像度で描き直すのは無駄なので、初回に一度だけ生成してキャッシュする。
+  const ocrCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const manualIdRef = useRef(0);
+  const selectionLayerRef = useRef<HTMLDivElement>(null);
+  const [drag, setDrag] = useState<DragState | null>(null);
+  const [regionOcrRunning, setRegionOcrRunning] = useState(false);
+  const [regionError, setRegionError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -51,6 +102,9 @@ export default function PdfOverlayViewer({
         }).promise;
 
         const page = await doc.getPage(1);
+        // 手動領域OCRで再利用するためページを保持し、前のドキュメントの高解像度キャッシュは破棄する。
+        pageRef.current = page as unknown as RenderablePage;
+        ocrCanvasRef.current = null;
         const viewport = page.getViewport({ scale: SCALE });
 
         if (cancelled) return;
@@ -112,6 +166,105 @@ export default function PdfOverlayViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
 
+  // 「文字を検出できませんでした」等の一時メッセージは数秒で自動的に消す。
+  useEffect(() => {
+    if (!regionError) return;
+    const t = setTimeout(() => setRegionError(null), 3500);
+    return () => clearTimeout(t);
+  }, [regionError]);
+
+  // マウスのclient座標を表示座標（SCALE空間・ズーム前）へ変換する。
+  // 選択レイヤーはCSS transform: scale(zoom) された内側divの中にあるため、
+  // getBoundingClientRect はズーム込みの実寸を返す。zoomで割ってズーム前の座標に戻す。
+  function toDisplay(e: React.MouseEvent): { x: number; y: number } {
+    const rect = selectionLayerRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    return { x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom };
+  }
+
+  function handleSelectionDown(e: React.MouseEvent) {
+    if (!selectionMode) return;
+    e.preventDefault();
+    setRegionError(null);
+    const p = toDisplay(e);
+    setDrag({ startX: p.x, startY: p.y, curX: p.x, curY: p.y });
+  }
+
+  function handleSelectionMove(e: React.MouseEvent) {
+    if (!drag) return;
+    const p = toDisplay(e);
+    setDrag((d) => (d ? { ...d, curX: p.x, curY: p.y } : d));
+  }
+
+  function handleSelectionUp() {
+    if (!drag) return;
+    const sel = normalizeRect(drag);
+    setDrag(null);
+    if (sel.width < MIN_SELECTION_PX || sel.height < MIN_SELECTION_PX) return;
+    void runRegionOcr(sel);
+  }
+
+  async function runRegionOcr(sel: Box) {
+    const page = pageRef.current;
+    if (!page) return;
+    setRegionError(null);
+    setRegionOcrRunning(true);
+    try {
+      // フルページを高解像度で描いたcanvasをキャッシュ（初回のみ生成）。
+      let full = ocrCanvasRef.current;
+      if (!full) {
+        const vp = page.getViewport({ scale: OCR_SCALE });
+        full = document.createElement("canvas");
+        full.width = Math.floor(vp.width);
+        full.height = Math.floor(vp.height);
+        const fctx = full.getContext("2d");
+        if (!fctx) throw new Error("canvasコンテキストの取得に失敗しました");
+        await page.render({ canvas: full, canvasContext: fctx, viewport: vp }).promise;
+        ocrCanvasRef.current = full;
+      }
+
+      // 表示座標 → 高解像度canvasのピクセル座標（×OCR_SCALE/SCALE）。canvas範囲内にクランプする。
+      const ratio = OCR_SCALE / SCALE;
+      const sx = Math.max(0, Math.floor(sel.left * ratio));
+      const sy = Math.max(0, Math.floor(sel.top * ratio));
+      const sw = Math.min(full.width - sx, Math.ceil(sel.width * ratio));
+      const sh = Math.min(full.height - sy, Math.ceil(sel.height * ratio));
+      if (sw <= 0 || sh <= 0) return;
+
+      const crop = document.createElement("canvas");
+      crop.width = sw;
+      crop.height = sh;
+      const cctx = crop.getContext("2d");
+      if (!cctx) throw new Error("canvasコンテキストの取得に失敗しました");
+      cctx.drawImage(full, sx, sy, sw, sh, 0, 0, sw, sh);
+
+      const id = `manual-${manualIdRef.current++}`;
+      const group = await runOcrRegion(
+        crop,
+        SCALE / OCR_SCALE,
+        { left: sel.left, top: sel.top },
+        id
+      );
+      if (group) {
+        onManualRegion(group);
+      } else {
+        setRegionError("この範囲から翻訳できる文字を検出できませんでした");
+      }
+    } catch (e) {
+      setRegionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRegionOcrRunning(false);
+    }
+  }
+
+  // 手動グループと大きく重なる自動グループは非表示にして、手動ボックスで置き換える。
+  // 置き換えは描画抑制のみ（自動グループのstateや翻訳結果は保持したまま）。
+  const overlaps = (a: Box, b: Box) => centerInside(a, b) || centerInside(b, a);
+  const visibleAuto = groups.filter(
+    (g) => !manualGroups.some((m) => overlaps(g.box, m.box))
+  );
+  const rendered = [...visibleAuto, ...manualGroups].filter((g) => g.translatable);
+
   return (
     // 外側: ズーム後の実サイズぶんレイアウト領域を確保する（スクロールを正しく機能させるため）
     <div
@@ -132,8 +285,18 @@ export default function PdfOverlayViewer({
       >
         <canvas ref={canvasRef} className="block" />
         {ocrRunning && (
-          <p className="absolute inset-x-0 top-0 bg-amber-100 p-2 text-center text-xs text-amber-800">
+          <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800">
             このPDFにはテキスト層がないため、OCRでテキストを抽出しています（数十秒かかる場合があります）…
+          </p>
+        )}
+        {regionOcrRunning && (
+          <p className="absolute inset-x-0 top-0 z-20 bg-blue-100 p-2 text-center text-xs text-blue-800">
+            選択領域をOCRしています…
+          </p>
+        )}
+        {regionError && (
+          <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800">
+            {regionError}
           </p>
         )}
         {error && (
@@ -145,12 +308,41 @@ export default function PdfOverlayViewer({
           className="absolute inset-0"
           style={{ visibility: showTranslation ? "visible" : "hidden" }}
         >
-          {groups
-            .filter((g) => g.translatable)
-            .map((g) => (
-              <OverlayItem key={g.id} group={g} translation={translations[g.id]} />
-            ))}
+          {rendered.map((g) => (
+            <OverlayItem key={g.id} group={g} translation={translations[g.id]} />
+          ))}
         </div>
+        {selectionMode && (
+          // 最前面でマウスドラッグを受け取り、翻訳ボックスより上に選択矩形を描く。
+          <div
+            ref={selectionLayerRef}
+            onMouseDown={handleSelectionDown}
+            onMouseMove={handleSelectionMove}
+            onMouseUp={handleSelectionUp}
+            onMouseLeave={handleSelectionUp}
+            className="absolute inset-0 z-10"
+            style={{ cursor: "crosshair" }}
+          >
+            {drag &&
+              (() => {
+                const r = normalizeRect(drag);
+                return (
+                  <div
+                    style={{
+                      position: "absolute",
+                      left: r.left,
+                      top: r.top,
+                      width: r.width,
+                      height: r.height,
+                      border: "1.5px dashed #2563eb",
+                      background: "rgba(37,99,235,0.12)",
+                      pointerEvents: "none",
+                    }}
+                  />
+                );
+              })()}
+          </div>
+        )}
       </div>
     </div>
   );
