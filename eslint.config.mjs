@@ -12,6 +12,12 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // pdfjs-dist / tesseract.js からコピーした静的アセット（lint対象外）
+    "public/pdf.worker.min.mjs",
+    "public/cmaps/**",
+    "public/standard_fonts/**",
+    "public/tesseract/**",
+    "public/tesseract-core/**",
   ]),
 ]);
 
