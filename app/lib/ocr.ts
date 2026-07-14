@@ -1,7 +1,7 @@
 // テキスト層を持たない（スキャン/画像ベースの）PDFのためのOCRフォールバック。
 // tesseract.js は必ずブラウザ側の呼び出しからのみ使う（動的import + useEffect経由）。
 import type { Worker } from "tesseract.js";
-import { buildLineGroups } from "./pdf";
+import { buildLineGroups, isTranslatable } from "./pdf";
 import type { RawItem } from "./pdf";
 import type { LineGroup } from "./types";
 
@@ -81,4 +81,64 @@ export async function runOcr(
     id: `ocr-${g.id}`,
     translatable: g.translatable && !looksLikeOcrGarbage(g.text),
   }));
+}
+
+/**
+ * ユーザーが手動指定した領域（OCR用に高解像度でクロップしたcanvas）をOCRし、
+ * 認識した全単語を1つのテキスト・1つのbboxにまとめた単一のLineGroupを返す。
+ *
+ * 自動OCR（runOcr）がセル単位に細かく分割するのに対し、こちらは
+ * 「ユーザーが囲んだ範囲＝1つの翻訳単位」という意図に合わせて範囲全体を1つにまとめる。
+ *
+ * bbox は切り出しcanvasの原点基準なので、toDisplayScale で表示座標に戻したうえで
+ * 選択領域左上の offset（表示座標）を加算してページ絶対座標に合わせる。
+ * 文字が拾えない／翻訳対象でない場合は null を返す（呼び出し側で無視する）。
+ */
+export async function runOcrRegion(
+  canvas: HTMLCanvasElement,
+  toDisplayScale: number,
+  offset: { left: number; top: number },
+  id: string
+): Promise<LineGroup | null> {
+  const worker = await getWorker();
+  const { data } = await worker.recognize(canvas, {}, { blocks: true });
+
+  const words: string[] = [];
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  for (const block of data.blocks ?? []) {
+    for (const paragraph of block.paragraphs) {
+      for (const line of paragraph.lines) {
+        for (const word of line.words) {
+          const text = word.text.trim();
+          if (!text) continue;
+          words.push(text);
+          const { x0, y0, x1, y1 } = word.bbox;
+          if (x0 < minX) minX = x0;
+          if (y0 < minY) minY = y0;
+          if (x1 > maxX) maxX = x1;
+          if (y1 > maxY) maxY = y1;
+        }
+      }
+    }
+  }
+
+  const text = words.join(" ").trim();
+  if (!text || !isTranslatable(text) || looksLikeOcrGarbage(text)) return null;
+
+  return {
+    id,
+    text,
+    box: {
+      left: minX * toDisplayScale + offset.left,
+      top: minY * toDisplayScale + offset.top,
+      width: (maxX - minX) * toDisplayScale,
+      height: (maxY - minY) * toDisplayScale,
+      angle: 0,
+    },
+    translatable: true,
+  };
 }
