@@ -19,6 +19,8 @@ export default function PdfTranslatorApp() {
   const [manualGroups, setManualGroups] = useState<LineGroup[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [dropError, setDropError] = useState<string | null>(null);
+  // 「翻訳結果を削除」で非表示にした自動抽出グループのid集合。
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
   const [, startTransition] = useTransition();
   const abortRef = useRef<AbortController | null>(null);
   // 手動領域の翻訳は初回翻訳と独立して走らせるため、専用のコントローラで中断管理する。
@@ -32,6 +34,7 @@ export default function PdfTranslatorApp() {
     setFileName(name);
     setTranslations({});
     setManualGroups([]);
+    setDismissedIds(new Set());
     setSelectionMode(false);
     setStatus("idle");
     setErrorMessage(null);
@@ -151,6 +154,51 @@ export default function PdfTranslatorApp() {
       }
       return next;
     });
+  }, []);
+
+  const handleRetranslate = useCallback((group: LineGroup) => {
+    // いったん翻訳結果を消して「翻訳待ち」表示に戻し、同じテキストをLLMへ送り直す。
+    setTranslations((prev) => {
+      const next = { ...prev };
+      delete next[group.id];
+      return next;
+    });
+    const controller = new AbortController();
+    manualAbortRef.current = controller;
+    translateGroups(
+      [group],
+      (partial) => {
+        startTransition(() => {
+          setTranslations((prev) => ({ ...prev, ...partial }));
+        });
+      },
+      controller.signal
+    ).catch((e) => {
+      if (!controller.signal.aborted) {
+        console.error("再翻訳に失敗しました:", e);
+      }
+    });
+  }, []);
+
+  const handleDismiss = useCallback((id: string) => {
+    // 翻訳結果を消し、ボックス自体も非表示にする。
+    // この後ユーザーが「OCRエリア指定」で同じ場所を囲み直せば、新しい手動グループとして再翻訳できる。
+    setTranslations((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    if (id.startsWith("manual-")) {
+      // 手動グループは配列から取り除けば非表示になる。
+      setManualGroups((prev) => prev.filter((g) => g.id !== id));
+    } else {
+      // 自動抽出グループはViewer内部のstateなので直接消せない。非表示idとして記録する。
+      setDismissedIds((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+    }
   }, []);
 
   return (
@@ -276,6 +324,7 @@ export default function PdfTranslatorApp() {
               <span className="inline-block h-3 w-3 border-[1.5px] border-dashed border-[#ea580c] bg-[#fed7aa]" />
               翻訳失敗（原文のまま）
             </span>
+            <span>翻訳済みのボックスにマウスを乗せると再翻訳・削除ができます</span>
           </div>
         )}
       </div>
@@ -291,6 +340,9 @@ export default function PdfTranslatorApp() {
             selectionMode={selectionMode}
             manualGroups={manualGroups}
             onManualRegion={handleManualRegion}
+            dismissedIds={dismissedIds}
+            onRetranslate={handleRetranslate}
+            onDismiss={handleDismiss}
           />
         ) : (
           <div
