@@ -243,7 +243,15 @@ export default function PdfTranslatorApp() {
           targets,
           (partial) => {
             startTransition(() => {
-              setTranslations((prev) => ({ ...prev, ...partial }));
+              // 文脈適応翻訳（パス2）で更新された結果には refined: true を付け、
+              // オーバーレイ側で赤字表示できるようにする。
+              setTranslations((prev) => {
+                const next = { ...prev };
+                for (const [id, entry] of Object.entries(partial)) {
+                  next[id] = { ...entry, refined: true };
+                }
+                return next;
+              });
             });
           },
           controller.signal,
@@ -434,6 +442,10 @@ export default function PdfTranslatorApp() {
             <span className="flex items-center gap-1.5">
               <span className="inline-block h-3 w-3 border-[1.5px] border-dashed border-[#ea580c] bg-[#fed7aa]" />
               翻訳失敗（原文のまま）
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="font-semibold text-red-600">あ</span>
+              文脈を踏まえて再翻訳された訳文
             </span>
             <span>翻訳済みのボックスにマウスを乗せると再翻訳・削除ができます</span>
           </div>
