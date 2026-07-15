@@ -2,8 +2,16 @@
 
 import { useCallback, useRef, useState, useTransition } from "react";
 import PdfOverlayViewer from "./PdfOverlayViewer";
-import { translateGroups } from "@/app/lib/translate-client";
-import type { LineGroup, TranslationEntry } from "@/app/lib/types";
+import { analyzeDocument, translateGroups } from "@/app/lib/translate-client";
+import type { DocumentAnalysis, LineGroup, TranslationEntry } from "@/app/lib/types";
+
+const EXPERT_LABELS: Record<DocumentAnalysis["expert"], string> = {
+  finance: "金融・会計",
+  legal: "法務・契約",
+  medical: "医療・薬事",
+  technical: "技術・製造",
+  general: "一般文書",
+};
 
 export default function PdfTranslatorApp() {
   const [data, setData] = useState<ArrayBuffer | null>(null);
@@ -21,20 +29,36 @@ export default function PdfTranslatorApp() {
   const [dropError, setDropError] = useState<string | null>(null);
   // 「翻訳結果を削除」で非表示にした自動抽出グループのid集合。
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
+  // パス1（単語単位の独立翻訳）で抽出された自動グループ。パス2の文脈適応翻訳で
+  // 全体を対象に再翻訳する際に必要なため、Viewerからの通知を親側にも保持しておく。
+  const [extractedGroups, setExtractedGroups] = useState<LineGroup[]>([]);
+  // パス2: 文書全体の文脈推定→文脈を踏まえた全体再翻訳。
+  const [documentAnalysis, setDocumentAnalysis] = useState<DocumentAnalysis | null>(null);
+  const [refineStatus, setRefineStatus] = useState<
+    "idle" | "analyzing" | "refining" | "done" | "error"
+  >("idle");
+  const [refineError, setRefineError] = useState<string | null>(null);
   const [, startTransition] = useTransition();
   const abortRef = useRef<AbortController | null>(null);
   // 手動領域の翻訳は初回翻訳と独立して走らせるため、専用のコントローラで中断管理する。
   const manualAbortRef = useRef<AbortController | null>(null);
+  // パス2（文脈適応の全体再翻訳）専用のコントローラ。
+  const refineAbortRef = useRef<AbortController | null>(null);
   const failedCount = Object.values(translations).filter((t) => t.failed).length;
 
   const loadFile = useCallback(async (buffer: ArrayBuffer, name: string) => {
     abortRef.current?.abort();
     manualAbortRef.current?.abort();
+    refineAbortRef.current?.abort();
     setData(buffer);
     setFileName(name);
     setTranslations({});
     setManualGroups([]);
     setDismissedIds(new Set());
+    setExtractedGroups([]);
+    setDocumentAnalysis(null);
+    setRefineStatus("idle");
+    setRefineError(null);
     setSelectionMode(false);
     setStatus("idle");
     setErrorMessage(null);
@@ -97,6 +121,7 @@ export default function PdfTranslatorApp() {
   );
 
   const handleExtracted = useCallback((groups: LineGroup[]) => {
+    setExtractedGroups(groups);
     const controller = new AbortController();
     abortRef.current = controller;
     setStatus("translating");
@@ -179,6 +204,61 @@ export default function PdfTranslatorApp() {
       }
     });
   }, []);
+
+  const handleRefineWithContext = useCallback(() => {
+    refineAbortRef.current?.abort();
+    const controller = new AbortController();
+    refineAbortRef.current = controller;
+
+    // 削除された自動グループを除き、手動グループを加えた「現在表示中」の対象を集める。
+    const targets = [
+      ...extractedGroups.filter((g) => !dismissedIds.has(g.id)),
+      ...manualGroups,
+    ].filter((g) => g.translatable);
+
+    if (targets.length === 0) return;
+
+    setRefineStatus("analyzing");
+    setRefineError(null);
+
+    // 文脈推定には原文と現時点の訳文のペアを渡す。誤訳が混じっていても、
+    // 原文も一緒に見せることで文書全体の分野を推定しやすくする狙い。
+    const lines = targets.map((g) => {
+      const t = translations[g.id];
+      return t ? `${g.text} → ${t.text}` : g.text;
+    });
+
+    analyzeDocument(lines, controller.signal)
+      .then((analysis) => {
+        if (controller.signal.aborted) return;
+        if (!analysis) {
+          setRefineStatus("error");
+          setRefineError("文書の文脈を推定できませんでした（ローカルLLMの応答が不正でした）");
+          return;
+        }
+        setDocumentAnalysis(analysis);
+        setRefineStatus("refining");
+
+        return translateGroups(
+          targets,
+          (partial) => {
+            startTransition(() => {
+              setTranslations((prev) => ({ ...prev, ...partial }));
+            });
+          },
+          controller.signal,
+          { context: analysis.summary, expert: analysis.expert }
+        ).then(() => {
+          if (!controller.signal.aborted) setRefineStatus("done");
+        });
+      })
+      .catch((e) => {
+        if (!controller.signal.aborted) {
+          setRefineStatus("error");
+          setRefineError(e instanceof Error ? e.message : String(e));
+        }
+      });
+  }, [extractedGroups, manualGroups, dismissedIds, translations]);
 
   const handleDismiss = useCallback((id: string) => {
     // 翻訳結果を消し、ボックス自体も非表示にする。
@@ -306,6 +386,37 @@ export default function PdfTranslatorApp() {
               >
                 手動選択をクリア（{manualGroups.length}）
               </button>
+            )}
+          </div>
+        )}
+
+        {data && (status === "done" || refineStatus !== "idle") && (
+          <div className="flex flex-col gap-2 rounded-lg border border-blue-200 bg-blue-50 p-3 dark:border-blue-900 dark:bg-blue-950/30">
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleRefineWithContext}
+                disabled={refineStatus === "analyzing" || refineStatus === "refining"}
+                className="rounded-full bg-blue-600 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {refineStatus === "analyzing"
+                  ? "文書の文脈を推定中…"
+                  : refineStatus === "refining"
+                    ? "文脈を踏まえて再翻訳中…"
+                    : "文脈を踏まえて全体を再翻訳"}
+              </button>
+              <span className="text-xs text-blue-800 dark:text-blue-300">
+                単語ごとの独立翻訳を、文書全体の文脈を踏まえて見直します
+              </span>
+            </div>
+            {documentAnalysis && (
+              <p className="text-xs text-blue-900 dark:text-blue-200">
+                推定された文書: 「{documentAnalysis.summary}」（分野:{" "}
+                {EXPERT_LABELS[documentAnalysis.expert]}）
+              </p>
+            )}
+            {refineStatus === "error" && refineError && (
+              <p className="text-xs text-red-600">{refineError}</p>
             )}
           </div>
         )}
