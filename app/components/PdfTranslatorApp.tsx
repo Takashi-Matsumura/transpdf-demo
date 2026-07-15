@@ -244,11 +244,12 @@ export default function PdfTranslatorApp() {
           (partial) => {
             startTransition(() => {
               // 文脈適応翻訳（パス2）で更新された結果には refined: true を付け、
-              // オーバーレイ側で赤字表示できるようにする。
+              // 更新前の訳文（パス1時点のtext）を previousText として残す。
+              // オーバーレイ側はこの2つを文字単位で比較し、変わった箇所だけ赤字にする。
               setTranslations((prev) => {
                 const next = { ...prev };
                 for (const [id, entry] of Object.entries(partial)) {
-                  next[id] = { ...entry, refined: true };
+                  next[id] = { ...entry, refined: true, previousText: prev[id]?.text };
                 }
                 return next;
               });

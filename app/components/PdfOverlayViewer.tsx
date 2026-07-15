@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { groupTextItems, loadPdfjs } from "@/app/lib/pdf";
 import { runOcr, runOcrRegion } from "@/app/lib/ocr";
+import { diffChars } from "@/app/lib/diff";
 import type { Box, LineGroup, TranslationEntry } from "@/app/lib/types";
 
 type Props = {
@@ -383,6 +384,13 @@ function OverlayItem({
   // 「文脈を踏まえて全体を再翻訳」（パス2）で見直された訳文かどうか。
   // 枠・背景は既存の状態表示のまま、文字色だけ赤にして見分けられるようにする。
   const refined = translation?.refined ?? false;
+  // refined時、更新前(previousText)と現在(text)を文字単位で比較し、実際に
+  // 変わった区間だけ抽出する。previousTextが無い/完全一致なら差分なし(通常表示)。
+  // diffCharsは1翻訳ボックスぶん（数十文字程度）が対象で軽量なため、都度計算する。
+  const diffSegments =
+    refined && translation?.previousText && translation.previousText !== text
+      ? diffChars(translation.previousText, text)
+      : null;
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -445,15 +453,27 @@ function OverlayItem({
           whiteSpace: "nowrap",
           fontSize,
           lineHeight: 1.3,
-          // 文脈適応翻訳（パス2）で見直された訳文は赤字にして、パス1のままの
-          // 訳文と見分けられるようにする。
-          color: refined ? "#dc2626" : "#111111",
-          fontWeight: refined ? 600 : undefined,
+          color: "#111111",
           transform: scaleX < 1 ? `scaleX(${scaleX})` : undefined,
           transformOrigin: "left top",
         }}
       >
-        {text}
+        {diffSegments
+          ? // 文脈適応翻訳（パス2）で実際に変わった区間だけ赤字にする。
+            // 変わっていない区間はそのまま黒字（旧訳と同じ）。
+            diffSegments.map((seg, i) => (
+              <span
+                key={i}
+                style={
+                  seg.changed
+                    ? { color: "#dc2626", fontWeight: 600 }
+                    : undefined
+                }
+              >
+                {seg.text}
+              </span>
+            ))
+          : text}
       </div>
       {!loading && hovered && (
         // 翻訳が済んだボックス（青=成功/オレンジ=失敗）にホバーすると、再翻訳・削除の小さなボタンを重ねて表示する。
