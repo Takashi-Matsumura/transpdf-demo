@@ -36,9 +36,14 @@ export type TranslationEntry = {
   failed: boolean;
   /**
    * 「文脈を踏まえて全体を再翻訳」（パス2の文脈適応翻訳）で更新された結果ならtrue。
-   * オーバーレイ側で赤字表示にし、パス1の独立翻訳から見直された箇所と分かるようにする。
+   * オーバーレイ側で、旧訳（previousText）との文字差分がある箇所だけ赤字表示する。
    */
   refined?: boolean;
+  /**
+   * refined:true のとき、更新される直前（パス1時点）の訳文。
+   * これと現在の text を文字単位で比較し、実際に変わった部分だけを赤字にするために使う。
+   */
+  previousText?: string;
 };
 
 /**
