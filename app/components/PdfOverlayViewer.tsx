@@ -380,6 +380,9 @@ function OverlayItem({
   const text = translation?.text ?? group.text;
   const loading = translation === undefined;
   const failed = translation?.failed ?? false;
+  // 「文脈を踏まえて全体を再翻訳」（パス2）で見直された訳文かどうか。
+  // 枠・背景は既存の状態表示のまま、文字色だけ赤にして見分けられるようにする。
+  const refined = translation?.refined ?? false;
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -410,7 +413,9 @@ function OverlayItem({
           ? "ローカルLLMからの応答が得られなかったため原文を表示しています（ホバーで再翻訳・削除）"
           : loading
             ? "翻訳待ちです"
-            : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
+            : refined
+              ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示・ホバーで再翻訳・削除）"
+              : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
       }
       style={{
         position: "absolute",
@@ -440,7 +445,10 @@ function OverlayItem({
           whiteSpace: "nowrap",
           fontSize,
           lineHeight: 1.3,
-          color: "#111111",
+          // 文脈適応翻訳（パス2）で見直された訳文は赤字にして、パス1のままの
+          // 訳文と見分けられるようにする。
+          color: refined ? "#dc2626" : "#111111",
+          fontWeight: refined ? 600 : undefined,
           transform: scaleX < 1 ? `scaleX(${scaleX})` : undefined,
           transformOrigin: "left top",
         }}
