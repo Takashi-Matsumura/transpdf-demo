@@ -2,6 +2,7 @@
   "name": "transpdf-demo",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "predev": "node scripts/copy-pdfjs-assets.mjs",
     "dev": "next dev",
