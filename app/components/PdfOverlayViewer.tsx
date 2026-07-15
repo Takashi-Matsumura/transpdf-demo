@@ -22,6 +22,12 @@ type Props = {
   manualGroups: LineGroup[];
   /** 手動領域のOCRが成功したとき、生成した1グループを親へ通知 */
   onManualRegion: (group: LineGroup) => void;
+  /** ユーザーが削除した自動抽出グループのid集合。該当グループの描画を抑制する */
+  dismissedIds: Set<string>;
+  /** 失敗ボックスの「再翻訳」ボタンが押されたとき、対象グループを親へ通知 */
+  onRetranslate: (group: LineGroup) => void;
+  /** 失敗ボックスの「削除」ボタンが押されたとき、対象idを親へ通知 */
+  onDismiss: (id: string) => void;
 };
 
 const SCALE = 1.5;
@@ -69,6 +75,9 @@ export default function PdfOverlayViewer({
   selectionMode,
   manualGroups,
   onManualRegion,
+  dismissedIds,
+  onRetranslate,
+  onDismiss,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [groups, setGroups] = useState<LineGroup[]>([]);
@@ -257,11 +266,11 @@ export default function PdfOverlayViewer({
     }
   }
 
-  // 手動グループと大きく重なる自動グループは非表示にして、手動ボックスで置き換える。
-  // 置き換えは描画抑制のみ（自動グループのstateや翻訳結果は保持したまま）。
+  // 手動グループと大きく重なる自動グループ、およびユーザーが削除した自動グループは非表示にする。
+  // 削除は描画抑制のみ（自動グループのstateや翻訳結果自体は保持したまま。dismissedIds側で制御）。
   const overlaps = (a: Box, b: Box) => centerInside(a, b) || centerInside(b, a);
   const visibleAuto = groups.filter(
-    (g) => !manualGroups.some((m) => overlaps(g.box, m.box))
+    (g) => !dismissedIds.has(g.id) && !manualGroups.some((m) => overlaps(g.box, m.box))
   );
   const rendered = [...visibleAuto, ...manualGroups].filter((g) => g.translatable);
 
@@ -309,7 +318,13 @@ export default function PdfOverlayViewer({
           style={{ visibility: showTranslation ? "visible" : "hidden" }}
         >
           {rendered.map((g) => (
-            <OverlayItem key={g.id} group={g} translation={translations[g.id]} />
+            <OverlayItem
+              key={g.id}
+              group={g}
+              translation={translations[g.id]}
+              onRetranslate={onRetranslate}
+              onDismiss={onDismiss}
+            />
           ))}
         </div>
         {selectionMode && (
@@ -351,12 +366,17 @@ export default function PdfOverlayViewer({
 function OverlayItem({
   group,
   translation,
+  onRetranslate,
+  onDismiss,
 }: {
   group: LineGroup;
   translation: TranslationEntry | undefined;
+  onRetranslate: (group: LineGroup) => void;
+  onDismiss: (id: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [scaleX, setScaleX] = useState(1);
+  const [hovered, setHovered] = useState(false);
   const text = translation?.text ?? group.text;
   const loading = translation === undefined;
   const failed = translation?.failed ?? false;
@@ -383,12 +403,14 @@ function OverlayItem({
 
   return (
     <div
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       title={
         failed
-          ? "ローカルLLMからの応答が得られなかったため原文を表示しています"
+          ? "ローカルLLMからの応答が得られなかったため原文を表示しています（ホバーで再翻訳・削除）"
           : loading
             ? "翻訳待ちです"
-            : "ローカルLLMによる翻訳です"
+            : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
       }
       style={{
         position: "absolute",
@@ -425,6 +447,37 @@ function OverlayItem({
       >
         {text}
       </div>
+      {!loading && hovered && (
+        // 翻訳が済んだボックス（青=成功/オレンジ=失敗）にホバーすると、再翻訳・削除の小さなボタンを重ねて表示する。
+        // 文字化けなど、システム上は成功でも実質失敗しているケースも直せるよう、失敗フラグに限定しない。
+        <div
+          className="absolute -top-2.5 -right-2.5 z-30 flex gap-1"
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            title="再翻訳する"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRetranslate(group);
+            }}
+            className="flex h-5 w-5 items-center justify-center rounded-full border border-blue-500 bg-white text-[11px] leading-none text-blue-700 shadow hover:bg-blue-50"
+          >
+            ⟲
+          </button>
+          <button
+            type="button"
+            title="この翻訳結果を削除する（削除後、OCRエリア指定で範囲を囲み直すと再翻訳できます）"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDismiss(group.id);
+            }}
+            className="flex h-5 w-5 items-center justify-center rounded-full border border-red-500 bg-white text-[11px] leading-none text-red-700 shadow hover:bg-red-50"
+          >
+            ×
+          </button>
+        </div>
+      )}
     </div>
   );
 }
