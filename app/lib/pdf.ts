@@ -84,8 +84,10 @@ function toRawItems(
     const angle = Math.atan2(tx[1], tx[0]);
     const originX = tx[4];
     const originY = tx[5];
-    // 前進幅（回転考慮）: (item.width, 0) を合成行列で変換した長さ
-    const widthPx = Math.hypot(tx[0] * item.width, tx[1] * item.width);
+    // item.width は回転前のPDFユーザー空間での前進幅なので、viewportの拡大率のみを掛ける。
+    // tx[0]/tx[1] にはフォント自体のスケール（文字サイズ）も含まれており、それを掛けると
+    // 幅が二重にスケールされて実際より大きくなってしまう（pdf.js公式のtext_layerと同じ計算式）。
+    const widthPx = item.width * viewport.scale;
 
     raw.push({
       text: item.str,

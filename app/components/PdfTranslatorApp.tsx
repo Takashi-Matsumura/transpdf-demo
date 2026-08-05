@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import PdfOverlayViewer from "./PdfOverlayViewer";
 import { analyzeDocument, translateGroups } from "@/app/lib/translate-client";
 import type { DocumentAnalysis, LineGroup, TranslationEntry } from "@/app/lib/types";
@@ -269,6 +269,31 @@ export default function PdfTranslatorApp() {
       });
   }, [extractedGroups, manualGroups, dismissedIds, translations]);
 
+  // Spaceキーで日本語オーバーレイの表示/非表示を切り替える。
+  // フォーム要素にフォーカスがある間はSpaceキー本来の挙動（ボタン押下・チェック等）を優先し、
+  // それ以外の場合のみページスクロールを止めてトグルする。
+  useEffect(() => {
+    if (!data) return;
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.code !== "Space") return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        tag === "BUTTON" ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setShowTranslation((v) => !v);
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [data]);
+
   const handleDismiss = useCallback((id: string) => {
     // 翻訳結果を消し、ボックス自体も非表示にする。
     // この後ユーザーが「OCRエリア指定」で同じ場所を囲み直せば、新しい手動グループとして再翻訳できる。
@@ -320,6 +345,7 @@ export default function PdfTranslatorApp() {
                 onChange={(e) => setShowTranslation(e.target.checked)}
               />
               日本語訳を表示
+              <span className="text-xs text-zinc-400">(Spaceキーで切替)</span>
             </label>
           )}
         </div>
