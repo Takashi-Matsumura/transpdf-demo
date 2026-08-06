@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { groupTextItems, loadPdfjs } from "@/app/lib/pdf";
+import { detectSourceLang, groupTextItems, loadPdfjs } from "@/app/lib/pdf";
 import { runOcr, runOcrRegion } from "@/app/lib/ocr";
 import { diffChars } from "@/app/lib/diff";
-import type { Box, LineGroup, TranslationEntry } from "@/app/lib/types";
+import type { Box, LineGroup, SourceLang, TranslationEntry } from "@/app/lib/types";
 
 type Props = {
   /** 表示するPDFの生データ */
@@ -17,6 +17,15 @@ type Props = {
   zoom: number;
   /** 抽出したテキストグループを親へ通知（翻訳リクエストのトリガー用） */
   onExtracted: (groups: LineGroup[]) => void;
+  /**
+   * 原文の言語。手動選択されていれば確定値、未選択かつ自動判定済みなら推定値、
+   * どちらもまだなら null（OCR時は判定兼用の複数言語同時読みになる）。
+   */
+  sourceLang: SourceLang | null;
+  /** 抽出/OCR結果から言語を推定できたときに呼ばれる（手動選択があれば呼び出し側で無視してよい） */
+  onDetectedLang: (lang: SourceLang) => void;
+  /** OCRの平均信頼度が得られるたびに呼ばれる（低信頼度の警告表示用）。テキスト層抽出時はnull。 */
+  onOcrConfidence?: (confidence: number | null) => void;
   /** trueならマウスドラッグでOCR領域を追加指定できる */
   selectionMode: boolean;
   /** 手動指定で追加されたグループ（親が保持。描画用） */
@@ -73,6 +82,9 @@ export default function PdfOverlayViewer({
   showTranslation,
   zoom,
   onExtracted,
+  sourceLang,
+  onDetectedLang,
+  onOcrConfidence,
   selectionMode,
   manualGroups,
   onManualRegion,
@@ -85,10 +97,14 @@ export default function PdfOverlayViewer({
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [error, setError] = useState<string | null>(null);
   const [ocrRunning, setOcrRunning] = useState(false);
+  // "probe": 言語未確定での判定兼用パス（この後、確定言語で読み直しが発生する）。
+  // "final": 確定した言語（手動選択 or 判定済み）でのOCR。
+  const [ocrPhase, setOcrPhase] = useState<"probe" | "final">("final");
 
   // 手動OCR領域指定まわり
   const pageRef = useRef<RenderablePage | null>(null);
-  // 手動選択のたびにフルページを高解像度で描き直すのは無駄なので、初回に一度だけ生成してキャッシュする。
+  // 手動選択・自動OCRの両方で使う高解像度フルページcanvas。
+  // ドキュメント（data）が変わるたびに破棄し、初回アクセス時に一度だけ生成してキャッシュする。
   const ocrCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const manualIdRef = useRef(0);
   const selectionLayerRef = useRef<HTMLDivElement>(null);
@@ -96,11 +112,23 @@ export default function PdfOverlayViewer({
   const [regionOcrRunning, setRegionOcrRunning] = useState(false);
   const [regionError, setRegionError] = useState<string | null>(null);
 
+  // effect 1（PDF読込・描画・テキスト層抽出）の結果を effect 2（言語依存の
+  // 抽出確定・OCR）へ橋渡しするref。テキスト層があれば抽出済みグループを、
+  // 無ければ null を入れる（= OCRが必要という合図）。
+  const textLayerGroupsRef = useRef<LineGroup[] | null>(null);
+  // effect 1完了のたびにインクリメントし、effect 2を起動するトリガー。
+  const [pageToken, setPageToken] = useState(0);
+
+  // effect 1: PDFの読込・canvas描画・テキスト層抽出。dataが変わったときだけ実行する。
+  // 言語（sourceLang）はここでは使わない — テキスト層があるPDFなら抽出結果は言語に
+  // 依存しないため、言語変更のたびにPDFを再パース・再描画する必要はない。
   useEffect(() => {
     let cancelled = false;
 
     async function render() {
       setError(null);
+      setGroups([]);
+      onOcrConfidence?.(null);
       try {
         const pdfjs = await loadPdfjs();
         // getDocument は渡した ArrayBuffer を detach/transfer することがあるため複製して渡す
@@ -109,6 +137,10 @@ export default function PdfOverlayViewer({
           cMapUrl: "/cmaps/",
           cMapPacked: true,
           standardFontDataUrl: "/standard_fonts/",
+          // JBIG2/JPX/ICC のデコードに使うwasm。未指定だとスキャンPDF（JBIG2圧縮の
+          // 白黒画像等）で Jbig2Error が発生し、画像マスクが丸ごと破棄されて
+          // canvasに何も描画されない（末尾スラッシュ必須。無いとpdfjs側で例外になる）。
+          wasmUrl: "/wasm/",
         }).promise;
 
         const page = await doc.getPage(1);
@@ -134,34 +166,27 @@ export default function PdfOverlayViewer({
         const textContent = await page.getTextContent();
         if (cancelled) return;
 
-        let extracted = groupTextItems(pdfjs, textContent.items, viewport);
+        const extracted = groupTextItems(pdfjs, textContent.items, viewport);
 
-        if (extracted.length === 0) {
-          // テキスト層が存在しない（スキャン/画像ベースの）PDF。OCRにフォールバックする。
-          setOcrRunning(true);
-          try {
-            const ocrViewport = page.getViewport({ scale: OCR_SCALE });
-            const ocrCanvas = document.createElement("canvas");
-            ocrCanvas.width = Math.floor(ocrViewport.width);
-            ocrCanvas.height = Math.floor(ocrViewport.height);
-            const ocrCtx = ocrCanvas.getContext("2d");
-            if (ocrCtx) {
-              await page.render({
-                canvas: ocrCanvas,
-                canvasContext: ocrCtx,
-                viewport: ocrViewport,
-              }).promise;
-              if (cancelled) return;
-              extracted = await runOcr(ocrCanvas, SCALE / OCR_SCALE);
-            }
-          } finally {
-            if (!cancelled) setOcrRunning(false);
-          }
+        if (extracted.length > 0) {
+          // テキスト層がある。OCRは不要。抽出結果から言語を推定できれば通知する
+          // （数字・記号だけのグループを分母に含めると比率が薄まるため、
+          //  isTranslatable を通ったグループのテキストだけをサンプルにする）。
+          const sample = extracted
+            .filter((g) => g.translatable)
+            .map((g) => g.text)
+            .join(" ");
+          const detected = detectSourceLang(sample);
+          if (detected) onDetectedLang(detected);
+          textLayerGroupsRef.current = extracted;
+        } else {
+          // テキスト層が存在しない（スキャン/画像ベースの）PDF。OCRは
+          // effect 2（言語に応じて内容が変わる）側で行う。
+          textLayerGroupsRef.current = null;
         }
 
         if (cancelled) return;
-        setGroups(extracted);
-        onExtracted(extracted);
+        setPageToken((t) => t + 1);
       } catch (e) {
         if (!cancelled) {
           setError(e instanceof Error ? e.message : String(e));
@@ -173,8 +198,73 @@ export default function PdfOverlayViewer({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data]);
+  }, [data, onDetectedLang, onOcrConfidence]);
+
+  // effect 2: 言語が確定/変更されるたびに、抽出結果を確定させる。
+  // テキスト層がある文書はキャッシュ済みのグループをそのまま再送するだけ（再抽出なし）。
+  // テキスト層が無い文書はOCRを（再）実行する。
+  useEffect(() => {
+    if (pageToken === 0) return; // effect 1がまだ一度も完了していない
+    let cancelled = false;
+
+    async function resolveGroups() {
+      const cached = textLayerGroupsRef.current;
+      if (cached) {
+        setGroups(cached);
+        onExtracted(cached);
+        return;
+      }
+
+      const page = pageRef.current;
+      if (!page) return;
+      // sourceLangがnullの時点で始めるOCRは「判定兼用の1パス目」。
+      // バナー文言を分けて、これから読み直しが発生しうることを伝える。
+      setOcrPhase(sourceLang === null ? "probe" : "final");
+      setOcrRunning(true);
+      try {
+        // フルページを高解像度で描いたcanvasをキャッシュ（初回のみ生成、手動領域OCRとも共有）。
+        let full = ocrCanvasRef.current;
+        if (!full) {
+          const ocrViewport = page.getViewport({ scale: OCR_SCALE });
+          full = document.createElement("canvas");
+          full.width = Math.floor(ocrViewport.width);
+          full.height = Math.floor(ocrViewport.height);
+          const ocrCtx = full.getContext("2d");
+          if (!ocrCtx) return;
+          await page.render({
+            canvas: full,
+            canvasContext: ocrCtx,
+            viewport: ocrViewport,
+          }).promise;
+          if (cancelled) return;
+          ocrCanvasRef.current = full;
+        }
+
+        const result = await runOcr(full, SCALE / OCR_SCALE, sourceLang);
+        if (cancelled) return;
+
+        if (sourceLang === null && result.detected) {
+          // 判定専用パス（PROBE_LANGSでの多言語同時OCR）。検出した言語が
+          // 親に伝わると sourceLang が確定し、このeffectが確定言語で再実行される。
+          // 捨てる予定のこの結果は翻訳へ回さない（LLM呼び出しが二重になるため）。
+          onDetectedLang(result.detected);
+          return;
+        }
+
+        setGroups(result.groups);
+        onExtracted(result.groups);
+        if (result.detected) onDetectedLang(result.detected);
+        onOcrConfidence?.(result.confidence);
+      } finally {
+        if (!cancelled) setOcrRunning(false);
+      }
+    }
+
+    void resolveGroups();
+    return () => {
+      cancelled = true;
+    };
+  }, [pageToken, sourceLang, onExtracted, onDetectedLang, onOcrConfidence]);
 
   // 「文字を検出できませんでした」等の一時メッセージは数秒で自動的に消す。
   useEffect(() => {
@@ -253,7 +343,8 @@ export default function PdfOverlayViewer({
         crop,
         SCALE / OCR_SCALE,
         { left: sel.left, top: sel.top },
-        id
+        id,
+        sourceLang
       );
       if (group) {
         onManualRegion(group);
@@ -296,7 +387,9 @@ export default function PdfOverlayViewer({
         <canvas ref={canvasRef} className="block" />
         {ocrRunning && (
           <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800">
-            このPDFにはテキスト層がないため、OCRでテキストを抽出しています（数十秒かかる場合があります）…
+            {ocrPhase === "probe"
+              ? "このPDFにはテキスト層がないため、原文の言語を判定しながらOCRしています（数十秒かかる場合があります）…"
+              : "指定した言語でOCRを実行しています（数十秒かかる場合があります）…"}
           </p>
         )}
         {regionOcrRunning && (

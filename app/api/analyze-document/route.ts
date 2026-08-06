@@ -6,7 +6,7 @@
 // localhost へ到達する必要があるため Edge ではなく Node ランタイムで実行する。
 export const runtime = "nodejs";
 
-import type { DocumentAnalysis, ExpertKey } from "@/app/lib/types";
+import type { DocumentAnalysis, ExpertKey, SourceLang } from "@/app/lib/types";
 
 const LLAMA_MODEL = process.env.LLAMA_MODEL ?? "gemma-4-12b-it-Q4_K_M.gguf";
 const TIMEOUT_MS = 30_000;
@@ -15,20 +15,27 @@ const MAX_SAMPLE_LINES = 60;
 const MAX_CHARS_PER_LINE = 40;
 
 const EXPERT_KEYS: ExpertKey[] = ["finance", "legal", "medical", "technical", "general"];
+const SOURCE_LANGS: SourceLang[] = ["vie", "eng", "mya"];
+const SOURCE_LANG_LABELS: Record<SourceLang, string> = {
+  vie: "ベトナム語",
+  eng: "英語",
+  mya: "ミャンマー語",
+};
 
-function buildPrompt(lines: string[]): string {
+function buildPrompt(lines: string[], sourceLang?: SourceLang): string {
   const sample = lines
     .slice(0, MAX_SAMPLE_LINES)
     .map((l) => l.slice(0, MAX_CHARS_PER_LINE))
     .join("\n");
+  const langLabel = sourceLang ? SOURCE_LANG_LABELS[sourceLang] : "外国語";
 
-  return `以下は、あるベトナム語PDF文書から抽出した断片的な単語・訳文の一覧です（原文と暫定的な日本語訳が混在しています）。
+  return `以下は、ある${langLabel}のPDF文書から抽出した断片的な単語・訳文の一覧です（原文と暫定的な日本語訳が混在しています）。
 これらの断片から、この文書が全体として何についての資料か（分野・種類・目的）を推定してください。
 
 出力は次のJSON形式のみで、説明文やコードブロックの記号は付けないでください。
 {"summary": "1〜2文の日本語の要約", "expert": "finance" | "legal" | "medical" | "technical" | "general" のいずれか1つ}
 
-- summary: 例「ベトナムの銀行が発行した法人向け口座取引明細書」のように、文書の種類と分野を具体的に。
+- summary: 例「銀行が発行した法人向け口座取引明細書」「政府機関が発行した会社設立証明書」のように、文書の種類と分野を具体的に。
 - expert: 文書の分野に最も近いものを1つだけ選んでください。該当がなければ "general"。
 
 断片一覧:
@@ -57,9 +64,11 @@ function parseAnalysis(raw: string): DocumentAnalysis | null {
 
 export async function POST(request: Request) {
   let lines: unknown;
+  let sourceLang: unknown;
   try {
     const body = await request.json();
     lines = body?.lines;
+    sourceLang = body?.sourceLang;
   } catch {
     return Response.json({ error: "invalid_json" }, { status: 400 });
   }
@@ -69,6 +78,10 @@ export async function POST(request: Request) {
   }
 
   const textLines = lines.map((l) => String(l));
+  const sourceLangKey: SourceLang | undefined =
+    typeof sourceLang === "string" && SOURCE_LANGS.includes(sourceLang as SourceLang)
+      ? (sourceLang as SourceLang)
+      : undefined;
   const base = process.env.LLAMA_BASE_URL ?? "http://127.0.0.1:8080";
 
   const controller = new AbortController();
@@ -81,7 +94,7 @@ export async function POST(request: Request) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: LLAMA_MODEL,
-        messages: [{ role: "user", content: buildPrompt(textLines) }],
+        messages: [{ role: "user", content: buildPrompt(textLines, sourceLangKey) }],
         temperature: 0.2,
         top_p: 0.9,
         max_tokens: 300,

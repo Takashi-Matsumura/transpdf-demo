@@ -25,7 +25,16 @@ if (existsSync(pdfjsDir)) {
     path.join(publicDir, "standard_fonts"),
     { recursive: true }
   );
-  console.log("[copy-vendor-assets] synced pdfjs worker/cmaps/standard_fonts");
+  // JBIG2/JPX/ICC のデコードは wasm で行われる。未同梱だと getDocument() に
+  // wasmUrl を渡せず、スキャンPDF（JBIG2圧縮の白黒画像等）のデコードに失敗して
+  // 画像が丸ごと破棄される（Jbig2Error）。*_nowasm_fallback.js も同ディレクトリに
+  // あるため、フォルダごとコピーして wasm 初期化失敗時の退避路も確保する。
+  cpSync(path.join(pdfjsDir, "wasm"), path.join(publicDir, "wasm"), {
+    recursive: true,
+  });
+  console.log(
+    "[copy-vendor-assets] synced pdfjs worker/cmaps/standard_fonts/wasm"
+  );
 } else {
   console.warn("[copy-vendor-assets] pdfjs-dist not found, skipping.");
 }
@@ -57,4 +66,38 @@ if (existsSync(tesseractDir) && existsSync(tesseractCoreDir)) {
   console.log("[copy-vendor-assets] synced tesseract.js worker/core");
 } else {
   console.warn("[copy-vendor-assets] tesseract.js not found, skipping.");
+}
+
+// --- tesseract.js の言語データ（traineddata） ---
+// 未指定だと実行時に jsDelivr CDN からダウンロードされ、オフライン環境や
+// 社内ネットワークからの初回アクセスで失敗する。あらかじめ public/ に
+// 同梱し、app/lib/ocr.ts の langPath でそちらを参照させる。
+// oem=1（LSTM_ONLY）で使うため、各パッケージの 4.0.0_best_int/ 側を使う
+// （langPath を明示すると tesseract.js 側の best_int 自動選択が効かなくなるため、
+//  こちらで正しいバリアントを選んでおく必要がある）。
+const LANGS = ["vie", "eng", "mya"];
+const langPublicDir = path.join(publicDir, "tesseract-lang");
+mkdirSync(langPublicDir, { recursive: true });
+const copiedLangs = [];
+for (const lang of LANGS) {
+  const src = path.join(
+    root,
+    "node_modules",
+    "@tesseract.js-data",
+    lang,
+    "4.0.0_best_int",
+    `${lang}.traineddata.gz`
+  );
+  if (!existsSync(src)) continue;
+  cpSync(src, path.join(langPublicDir, `${lang}.traineddata.gz`));
+  copiedLangs.push(lang);
+}
+if (copiedLangs.length > 0) {
+  console.log(
+    `[copy-vendor-assets] synced tesseract traineddata: ${copiedLangs.join(", ")}`
+  );
+} else {
+  console.warn(
+    "[copy-vendor-assets] @tesseract.js-data/* not found, skipping (OCR will fall back to CDN download)."
+  );
 }

@@ -3,7 +3,12 @@
 import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import PdfOverlayViewer from "./PdfOverlayViewer";
 import { analyzeDocument, translateGroups } from "@/app/lib/translate-client";
-import type { DocumentAnalysis, LineGroup, TranslationEntry } from "@/app/lib/types";
+import type {
+  DocumentAnalysis,
+  LineGroup,
+  SourceLang,
+  TranslationEntry,
+} from "@/app/lib/types";
 
 const EXPERT_LABELS: Record<DocumentAnalysis["expert"], string> = {
   finance: "金融・会計",
@@ -12,6 +17,17 @@ const EXPERT_LABELS: Record<DocumentAnalysis["expert"], string> = {
   technical: "技術・製造",
   general: "一般文書",
 };
+
+// UI用の短いラベル。api/translate/route.ts 側にプロンプト用の同名テーブルを
+// 別途持つ（EXPERT_LABELSと同じく意図的な重複。用途ごとに独立させる）。
+const SOURCE_LANG_LABELS: Record<SourceLang, string> = {
+  vie: "ベトナム語",
+  eng: "英語",
+  mya: "ミャンマー語",
+};
+const SOURCE_LANG_OPTIONS: (SourceLang | null)[] = [null, "vie", "eng", "mya"];
+// これ未満のOCR信頼度は、言語ミスマッチ等でOCRが破綻している可能性が高い。
+const LOW_OCR_CONFIDENCE = 60;
 
 export default function PdfTranslatorApp() {
   const [data, setData] = useState<ArrayBuffer | null>(null);
@@ -38,6 +54,14 @@ export default function PdfTranslatorApp() {
     "idle" | "analyzing" | "refining" | "done" | "error"
   >("idle");
   const [refineError, setRefineError] = useState<string | null>(null);
+  // ユーザーが明示的に選んだ原文言語。nullなら自動判定に従う。
+  const [langOverride, setLangOverride] = useState<SourceLang | null>(null);
+  // 抽出/OCR結果から自動判定した言語。判定できるまでnull。
+  const [detectedLang, setDetectedLang] = useState<SourceLang | null>(null);
+  // 実効言語。null は「未確定」＝OCRは判定兼用の複数言語同時読み、プロンプトは中立。
+  const sourceLang = langOverride ?? detectedLang;
+  // OCR（スキャンPDF）の平均信頼度。テキスト層抽出時はnullのまま。
+  const [ocrConfidence, setOcrConfidence] = useState<number | null>(null);
   const [, startTransition] = useTransition();
   const abortRef = useRef<AbortController | null>(null);
   // 手動領域の翻訳は初回翻訳と独立して走らせるため、専用のコントローラで中断管理する。
@@ -63,6 +87,9 @@ export default function PdfTranslatorApp() {
     setStatus("idle");
     setErrorMessage(null);
     setZoom(1);
+    setLangOverride(null);
+    setDetectedLang(null);
+    setOcrConfidence(null);
   }, []);
 
   const zoomIn = useCallback(() => {
@@ -120,53 +147,61 @@ export default function PdfTranslatorApp() {
     [loadPdfFile]
   );
 
-  const handleExtracted = useCallback((groups: LineGroup[]) => {
-    setExtractedGroups(groups);
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setStatus("translating");
-    setErrorMessage(null);
+  const handleExtracted = useCallback(
+    (groups: LineGroup[]) => {
+      setExtractedGroups(groups);
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setStatus("translating");
+      setErrorMessage(null);
 
-    translateGroups(
-      groups,
-      (partial) => {
-        startTransition(() => {
-          setTranslations((prev) => ({ ...prev, ...partial }));
+      translateGroups(
+        groups,
+        (partial) => {
+          startTransition(() => {
+            setTranslations((prev) => ({ ...prev, ...partial }));
+          });
+        },
+        controller.signal,
+        { sourceLang }
+      )
+        .then(() => {
+          if (!controller.signal.aborted) setStatus("done");
+        })
+        .catch((e) => {
+          if (!controller.signal.aborted) {
+            setStatus("error");
+            setErrorMessage(e instanceof Error ? e.message : String(e));
+          }
         });
-      },
-      controller.signal
-    )
-      .then(() => {
-        if (!controller.signal.aborted) setStatus("done");
-      })
-      .catch((e) => {
+    },
+    [sourceLang]
+  );
+
+  const handleManualRegion = useCallback(
+    (group: LineGroup) => {
+      setManualGroups((prev) => [...prev, group]);
+      // 初回翻訳のコントローラを奪わないよう、手動領域は専用コントローラで翻訳する。
+      const controller = new AbortController();
+      manualAbortRef.current = controller;
+      translateGroups(
+        [group],
+        (partial) => {
+          startTransition(() => {
+            setTranslations((prev) => ({ ...prev, ...partial }));
+          });
+        },
+        controller.signal,
+        { sourceLang }
+      ).catch((e) => {
+        // 手動領域の翻訳失敗は致命的ではないので、原文フォールバックのまま留める。
         if (!controller.signal.aborted) {
-          setStatus("error");
-          setErrorMessage(e instanceof Error ? e.message : String(e));
+          console.error("手動領域の翻訳に失敗しました:", e);
         }
       });
-  }, []);
-
-  const handleManualRegion = useCallback((group: LineGroup) => {
-    setManualGroups((prev) => [...prev, group]);
-    // 初回翻訳のコントローラを奪わないよう、手動領域は専用コントローラで翻訳する。
-    const controller = new AbortController();
-    manualAbortRef.current = controller;
-    translateGroups(
-      [group],
-      (partial) => {
-        startTransition(() => {
-          setTranslations((prev) => ({ ...prev, ...partial }));
-        });
-      },
-      controller.signal
-    ).catch((e) => {
-      // 手動領域の翻訳失敗は致命的ではないので、原文フォールバックのまま留める。
-      if (!controller.signal.aborted) {
-        console.error("手動領域の翻訳に失敗しました:", e);
-      }
-    });
-  }, []);
+    },
+    [sourceLang]
+  );
 
   const clearManualRegions = useCallback(() => {
     manualAbortRef.current?.abort();
@@ -181,29 +216,33 @@ export default function PdfTranslatorApp() {
     });
   }, []);
 
-  const handleRetranslate = useCallback((group: LineGroup) => {
-    // いったん翻訳結果を消して「翻訳待ち」表示に戻し、同じテキストをLLMへ送り直す。
-    setTranslations((prev) => {
-      const next = { ...prev };
-      delete next[group.id];
-      return next;
-    });
-    const controller = new AbortController();
-    manualAbortRef.current = controller;
-    translateGroups(
-      [group],
-      (partial) => {
-        startTransition(() => {
-          setTranslations((prev) => ({ ...prev, ...partial }));
-        });
-      },
-      controller.signal
-    ).catch((e) => {
-      if (!controller.signal.aborted) {
-        console.error("再翻訳に失敗しました:", e);
-      }
-    });
-  }, []);
+  const handleRetranslate = useCallback(
+    (group: LineGroup) => {
+      // いったん翻訳結果を消して「翻訳待ち」表示に戻し、同じテキストをLLMへ送り直す。
+      setTranslations((prev) => {
+        const next = { ...prev };
+        delete next[group.id];
+        return next;
+      });
+      const controller = new AbortController();
+      manualAbortRef.current = controller;
+      translateGroups(
+        [group],
+        (partial) => {
+          startTransition(() => {
+            setTranslations((prev) => ({ ...prev, ...partial }));
+          });
+        },
+        controller.signal,
+        { sourceLang }
+      ).catch((e) => {
+        if (!controller.signal.aborted) {
+          console.error("再翻訳に失敗しました:", e);
+        }
+      });
+    },
+    [sourceLang]
+  );
 
   const handleRefineWithContext = useCallback(() => {
     refineAbortRef.current?.abort();
@@ -228,7 +267,7 @@ export default function PdfTranslatorApp() {
       return t ? `${g.text} → ${t.text}` : g.text;
     });
 
-    analyzeDocument(lines, controller.signal)
+    analyzeDocument(lines, controller.signal, sourceLang)
       .then((analysis) => {
         if (controller.signal.aborted) return;
         if (!analysis) {
@@ -256,7 +295,7 @@ export default function PdfTranslatorApp() {
             });
           },
           controller.signal,
-          { context: analysis.summary, expert: analysis.expert }
+          { context: analysis.summary, expert: analysis.expert, sourceLang }
         ).then(() => {
           if (!controller.signal.aborted) setRefineStatus("done");
         });
@@ -267,7 +306,7 @@ export default function PdfTranslatorApp() {
           setRefineError(e instanceof Error ? e.message : String(e));
         }
       });
-  }, [extractedGroups, manualGroups, dismissedIds, translations]);
+  }, [extractedGroups, manualGroups, dismissedIds, translations, sourceLang]);
 
   // Spaceキーで日本語オーバーレイの表示/非表示を切り替える。
   // フォーム要素にフォーカスがある間はSpaceキー本来の挙動（ボタン押下・チェック等）を優先し、
@@ -315,6 +354,39 @@ export default function PdfTranslatorApp() {
     }
   }, []);
 
+  // 抽出/OCR結果から言語を推定できたときViewerから呼ばれる。自動判定は1文書に
+  // つき1回だけ採用する（OCRの判定パス→確定パスの2回目で再判定されても上書きしない）。
+  // 手動選択があればそちらが優先される（sourceLang = langOverride ?? detectedLang）ため、
+  // ここでは常に detectedLang を更新してよい。
+  const handleDetectedLang = useCallback((lang: SourceLang) => {
+    setDetectedLang((prev) => prev ?? lang);
+  }, []);
+
+  const handleOcrConfidence = useCallback((confidence: number | null) => {
+    setOcrConfidence(confidence);
+  }, []);
+
+  // 言語を手動で切り替える（自動判定に戻す場合はnullを渡す）。
+  // loadFileと同じ範囲（data/fileName/zoomは保持）を初期化し、Viewer側の
+  // 再抽出・再OCRをトリガーする。以降の再翻訳は sourceLang の変更をきっかけに
+  // handleExtracted 等が自動的に走る。
+  const handleChangeSourceLang = useCallback((lang: SourceLang | null) => {
+    abortRef.current?.abort();
+    manualAbortRef.current?.abort();
+    refineAbortRef.current?.abort();
+    setLangOverride(lang);
+    setDetectedLang(null);
+    setOcrConfidence(null);
+    setTranslations({});
+    setManualGroups([]);
+    setDismissedIds(new Set());
+    setDocumentAnalysis(null);
+    setRefineStatus("idle");
+    setRefineError(null);
+    setStatus("idle");
+    setErrorMessage(null);
+  }, []);
+
   return (
     <div className="flex flex-1 flex-col items-center gap-6 bg-zinc-50 px-6 py-10 dark:bg-black">
       <div className="flex w-full max-w-3xl flex-col gap-4">
@@ -322,8 +394,9 @@ export default function PdfTranslatorApp() {
           外国語PDF 日本語オーバーレイ翻訳
         </h1>
         <p className="text-sm text-zinc-600 dark:text-zinc-400">
-          ベトナム語などのPDFを読み込むと、常駐中のローカルLLM（llama.cpp /
+          ベトナム語・英語・ミャンマー語のPDFを読み込むと、常駐中のローカルLLM（llama.cpp /
           gemma-4-12b）が日本語に翻訳し、元のレイアウトの上に重ねて表示します。
+          原文の言語は自動判定されますが、下の「原文の言語」から手動でも選べます。
         </p>
 
         <div className="flex flex-wrap items-center gap-3">
@@ -391,6 +464,38 @@ export default function PdfTranslatorApp() {
             >
               リセット
             </button>
+          </div>
+        )}
+
+        {data && (
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="text-zinc-500 dark:text-zinc-400">原文の言語:</span>
+            {SOURCE_LANG_OPTIONS.map((lang) => (
+              <button
+                key={lang ?? "auto"}
+                type="button"
+                onClick={() => handleChangeSourceLang(lang)}
+                aria-pressed={langOverride === lang}
+                className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                  langOverride === lang
+                    ? "bg-blue-600 text-white hover:bg-blue-700"
+                    : "border border-black/[.15] hover:bg-black/[.04] dark:border-white/[.15] dark:hover:bg-[#1a1a1a]"
+                }`}
+              >
+                {lang === null ? "自動" : SOURCE_LANG_LABELS[lang]}
+              </button>
+            ))}
+            {langOverride === null && detectedLang && (
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                （自動判定: {SOURCE_LANG_LABELS[detectedLang]}）
+              </span>
+            )}
+          </div>
+        )}
+
+        {data && ocrConfidence !== null && ocrConfidence < LOW_OCR_CONFIDENCE && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+            OCRの信頼度が低いです（{Math.round(ocrConfidence)}）。上の「原文の言語」を選び直すと改善する場合があります。
           </div>
         )}
 
@@ -487,6 +592,9 @@ export default function PdfTranslatorApp() {
             showTranslation={showTranslation}
             zoom={zoom}
             onExtracted={handleExtracted}
+            sourceLang={sourceLang}
+            onDetectedLang={handleDetectedLang}
+            onOcrConfidence={handleOcrConfidence}
             selectionMode={selectionMode}
             manualGroups={manualGroups}
             onManualRegion={handleManualRegion}

@@ -4,7 +4,7 @@
 // ロードは動的 import (loadPdfjs) 経由に限定する。
 import type * as PdfjsNS from "pdfjs-dist";
 import type { PageViewport, PDFPageProxy } from "pdfjs-dist";
-import type { Box, LineGroup } from "./types";
+import type { Box, LineGroup, SourceLang } from "./types";
 
 // pdfjs-dist は TextItem を型エクスポートしていないため、
 // getTextContent() の戻り値から items の要素型を導出する。
@@ -37,6 +37,33 @@ function isMostlyJapanese(text: string): boolean {
   if (stripped.length === 0) return false;
   const jaCount = (stripped.match(JAPANESE_SCRIPT_RE) ?? []).length;
   return jaCount / stripped.length > 0.3;
+}
+
+// ミャンマー文字（基本ブロックのみ。拡張ブロックは実文書でほぼ使われない）。
+const MYANMAR_SCRIPT_RE = /[က-႟]/gu;
+// ベトナム語にしか現れないラテン文字（ă đ ơ ư と声調記号付きの U+1EA0–U+1EF9 ブロック）。
+// â ê ô à é などは他言語ともLatin-1で共有するため、あえて含めない。
+const VIETNAMESE_SCRIPT_RE = /[Ạ-ỹĂăĐđƠơƯư]/gu;
+
+const LANG_DETECT_MIN_CHARS = 20; // これ未満は判定材料不足として扱う
+const MYANMAR_RATIO_THRESHOLD = 0.1; // 英語併記の公文書でもミャンマー文字は1割は占める
+const VIETNAMESE_MIN_HITS = 3; // OCRノイズ1〜2文字での誤判定を防ぐ下限
+
+/**
+ * 抽出済みテキスト（複数グループぶんを連結したもの）から原文の言語を推定する。
+ * isMostlyJapanese と同じ「Unicodeスクリプトの出現比率で判定する」方式。
+ * 判定材料が乏しい場合は null を返し、呼び出し側は「未確定」として扱う
+ * （中立なプロンプトを使う／手動選択を促す）。
+ */
+export function detectSourceLang(text: string): SourceLang | null {
+  const stripped = text.replace(/\s/g, "");
+  if (stripped.length < LANG_DETECT_MIN_CHARS) return null;
+  const myanmarRatio =
+    (stripped.match(MYANMAR_SCRIPT_RE) ?? []).length / stripped.length;
+  if (myanmarRatio > MYANMAR_RATIO_THRESHOLD) return "mya";
+  const vietnameseHits = (stripped.match(VIETNAMESE_SCRIPT_RE) ?? []).length;
+  if (vietnameseHits >= VIETNAMESE_MIN_HITS) return "vie";
+  return /[A-Za-z]{2,}/.test(stripped) ? "eng" : null;
 }
 
 /** 数字・記号・空白のみ、または既に日本語のテキストは翻訳対象外とする。 */
