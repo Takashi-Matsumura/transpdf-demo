@@ -2,11 +2,17 @@ import type {
   DocumentAnalysis,
   ExpertKey,
   LineGroup,
+  SourceLang,
   TranslationEntry,
 } from "./types";
 
 /** パス2（文脈適応翻訳）で各翻訳リクエストに添える文脈とエキスパート。 */
-type TranslateOptions = { context?: string; expert?: ExpertKey };
+type TranslateOptions = {
+  context?: string;
+  expert?: ExpertKey;
+  /** 原文の言語。未確定（自動判定できていない）ならnull/undefined。 */
+  sourceLang?: SourceLang | null;
+};
 
 // サーバー側は1行ずつ独立して翻訳・リトライするため、クライアントは
 // 進捗をこまめに反映できるよう小さめのチャンクで送る。
@@ -65,6 +71,7 @@ export async function translateGroups(
             texts: uncached.map((g) => g.text),
             context: options?.context,
             expert: options?.expert,
+            sourceLang: options?.sourceLang ?? undefined,
           }),
           signal,
         });
@@ -98,14 +105,15 @@ export async function translateGroups(
  */
 export async function analyzeDocument(
   lines: string[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  sourceLang?: SourceLang | null
 ): Promise<DocumentAnalysis | null> {
   if (lines.length === 0) return null;
   try {
     const res = await fetch("/api/analyze-document", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lines }),
+      body: JSON.stringify({ lines, sourceLang: sourceLang ?? undefined }),
       signal,
     });
     if (!res.ok) return null;

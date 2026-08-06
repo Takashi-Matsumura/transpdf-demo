@@ -44,8 +44,10 @@ next-env.d.ts
 /public/pdf.worker.min.mjs
 /public/cmaps/
 /public/standard_fonts/
+/public/wasm/
 /public/tesseract/
 /public/tesseract-core/
+/public/tesseract-lang/
 
 # tesseract.js language data (downloaded on demand; Node runs cache to repo root)
 *.traineddata

@@ -14,7 +14,7 @@
 // 1行ずつの単純な平文翻訳に分割し、各行を独立してリトライ・成否判定する。
 export const runtime = "nodejs";
 
-import type { ExpertKey } from "@/app/lib/types";
+import type { ExpertKey, SourceLang } from "@/app/lib/types";
 
 // MoE（Mixture of Experts）モデルを使う場合、この環境変数でモデル名を切り替えられる。
 // dense/MoE いずれの場合も、下記の分野ヒント（buildPrompt の expertLabel）は
@@ -36,7 +36,19 @@ const EXPERT_LABELS: Record<ExpertKey, string> = {
   general: "一般文書",
 };
 
-function buildPrompt(text: string, context?: string, expert?: ExpertKey): string {
+const SOURCE_LANGS: SourceLang[] = ["vie", "eng", "mya"];
+const SOURCE_LANG_LABELS: Record<SourceLang, string> = {
+  vie: "ベトナム語",
+  eng: "英語",
+  mya: "ミャンマー語",
+};
+
+function buildPrompt(
+  text: string,
+  context?: string,
+  expert?: ExpertKey,
+  sourceLang?: SourceLang
+): string {
   // パス2（文脈適応翻訳）では、文書全体の要約と分野ヒントをプロンプト先頭に付与する。
   // 「単語ごとに独立翻訳」で欠けていた文書全体の文脈をここで補う。
   const contextBlock =
@@ -46,12 +58,17 @@ function buildPrompt(text: string, context?: string, expert?: ExpertKey): string
         }）。この文脈を踏まえて翻訳してください。\n\n`
       : "";
 
-  return `${contextBlock}次のベトナム語のテキストを自然で簡潔な日本語に翻訳してください。
+  // 言語が未確定（自動判定に失敗した）場合は「外国語」として中立に指示する。
+  // 誤った言語を断定して伝えるより、モデルに委ねたほうが訳文が安定する。
+  const langLabel = sourceLang ? SOURCE_LANG_LABELS[sourceLang] : "外国語";
+
+  return `${contextBlock}次の${langLabel}のテキストを自然で簡潔な日本語に翻訳してください。
 訳文だけを1行で出力してください（説明・前置き・引用符・原文の繰り返しは不要です）。
 数字・日付・口座番号・記号はできるだけそのまま残してください。
+原文には${langLabel}以外の言語（英語など）が混ざることがあります。実際の言語に関わらず日本語に訳してください。
 意味の無い文字列や翻訳できない場合は、そのまま出力してください。
 
-ベトナム語: ${text}
+原文: ${text}
 日本語:`;
 }
 
@@ -73,7 +90,8 @@ async function translateOne(
   text: string,
   outerSignal: AbortSignal,
   context?: string,
-  expert?: ExpertKey
+  expert?: ExpertKey,
+  sourceLang?: SourceLang
 ): Promise<{ text: string; failed: boolean }> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (outerSignal.aborted) return { text, failed: true };
@@ -89,7 +107,9 @@ async function translateOne(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: LLAMA_MODEL,
-          messages: [{ role: "user", content: buildPrompt(text, context, expert) }],
+          messages: [
+            { role: "user", content: buildPrompt(text, context, expert, sourceLang) },
+          ],
           temperature: 0.2,
           top_p: 0.9,
           max_tokens: estimateMaxTokens(text),
@@ -121,11 +141,13 @@ export async function POST(request: Request) {
   let texts: unknown;
   let context: unknown;
   let expert: unknown;
+  let sourceLang: unknown;
   try {
     const body = await request.json();
     texts = body?.texts;
     context = body?.context;
     expert = body?.expert;
+    sourceLang = body?.sourceLang;
   } catch {
     return Response.json({ translations: [], failed: [] }, { status: 400 });
   }
@@ -142,6 +164,10 @@ export async function POST(request: Request) {
     )
       ? (expert as ExpertKey)
       : undefined;
+  const sourceLangKey: SourceLang | undefined =
+    typeof sourceLang === "string" && SOURCE_LANGS.includes(sourceLang as SourceLang)
+      ? (sourceLang as SourceLang)
+      : undefined;
   const base = process.env.LLAMA_BASE_URL ?? "http://127.0.0.1:8080";
 
   const controller = new AbortController();
@@ -152,7 +178,14 @@ export async function POST(request: Request) {
   // llama.cppはローカル単一インスタンスのため並列化のメリットが薄く、
   // 直列に処理して各行のタイムアウト・リトライを独立に扱う。
   for (const text of textList) {
-    const result = await translateOne(base, text, controller.signal, contextStr, expertKey);
+    const result = await translateOne(
+      base,
+      text,
+      controller.signal,
+      contextStr,
+      expertKey,
+      sourceLangKey
+    );
     translations.push(result.text);
     failed.push(result.failed);
   }

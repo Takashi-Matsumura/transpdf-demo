@@ -19,15 +19,11 @@ export type LineGroup = {
   translatable: boolean;
 };
 
-export type TranslateRequestBody = {
-  texts: string[];
-};
-
-export type TranslateResponseBody = {
-  translations: string[];
-  /** 同じ長さの配列。true の要素はローカルLLMから応答が得られず原文にフォールバックした */
-  failed: boolean[];
-};
+/**
+ * 原文（翻訳元）の言語。OCRに使うtraineddataの組み合わせと、
+ * 翻訳プロンプトの言語指定の両方をこのキーで引く。
+ */
+export type SourceLang = "vie" | "eng" | "mya";
 
 /** オーバーレイに表示する1グループぶんの翻訳結果。 */
 export type TranslationEntry = {
