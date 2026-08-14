@@ -17,6 +17,8 @@ export type LineGroup = {
   box: Box;
   /** 数字・記号のみなど、翻訳不要と判定したグループ */
   translatable: boolean;
+  /** このグループが属するPDFページ番号（1始まり）。複数ページPDFでのid名前空間分離・表示制御に使う。 */
+  pageIndex: number;
 };
 
 /**

@@ -132,9 +132,10 @@ function toRawItems(
 export function groupTextItems(
   pdfjs: typeof PdfjsNS,
   items: TextContentItems,
-  viewport: PageViewport
+  viewport: PageViewport,
+  pageIndex: number
 ): LineGroup[] {
-  return buildLineGroups(toRawItems(pdfjs, items, viewport));
+  return buildLineGroups(toRawItems(pdfjs, items, viewport), { pageIndex });
 }
 
 /**
@@ -142,12 +143,17 @@ export function groupTextItems(
  * 行単位（ベースラインが近いアイテム）にバケット化し、各行内で水平ギャップが
  * 大きい箇所をセル境界とみなして分割する。表形式の明細で列同士の翻訳が
  * 混ざらないようにするための処理。抽出元（pdfjs/OCR）に依存しない汎用ロジック。
+ *
+ * idPrefix/pageIndex は複数ページPDFでのid名前空間分離のために指定する。
+ * 未指定時（pageIndex省略）は単一ページ扱い（pageIndex: 1）で従来どおりのid（"g0"等）になる。
  */
 export function buildLineGroups(
   raw: RawItem[],
-  options?: { joiner?: string }
+  options?: { joiner?: string; idPrefix?: string; pageIndex?: number }
 ): LineGroup[] {
   const joiner = options?.joiner ?? "";
+  const idPrefix = options?.idPrefix ?? "";
+  const pageIndex = options?.pageIndex ?? 1;
   if (raw.length === 0) return [];
 
   // ベースライン（bottom）でソートし、近いものを同じ行としてまとめる
@@ -187,10 +193,11 @@ export function buildLineGroups(
         angle: cell[0].angle,
       };
       groups.push({
-        id: `g${groupIndex++}`,
+        id: `${idPrefix}g${groupIndex++}`,
         text,
         box,
         translatable: isTranslatable(text),
+        pageIndex,
       });
       cell = [];
     };

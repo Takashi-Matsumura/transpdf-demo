@@ -34,9 +34,6 @@ export default function PdfTranslatorApp() {
   const [fileName, setFileName] = useState<string | null>(null);
   const [translations, setTranslations] = useState<Record<string, TranslationEntry>>({});
   const [showTranslation, setShowTranslation] = useState(true);
-  const [status, setStatus] = useState<"idle" | "translating" | "done" | "error">(
-    "idle"
-  );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -45,9 +42,14 @@ export default function PdfTranslatorApp() {
   const [dropError, setDropError] = useState<string | null>(null);
   // 「翻訳結果を削除」で非表示にした自動抽出グループのid集合。
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
-  // パス1（単語単位の独立翻訳）で抽出された自動グループ。パス2の文脈適応翻訳で
-  // 全体を対象に再翻訳する際に必要なため、Viewerからの通知を親側にも保持しておく。
+  // 全ページぶんの自動抽出グループを蓄積したもの（ページ完了ごとにhandleExtractedが更新）。
+  // パス2の文脈適応翻訳で全体を対象に再翻訳する際に使う。
   const [extractedGroups, setExtractedGroups] = useState<LineGroup[]>([]);
+  // ページ処理（テキスト抽出/OCR）の進捗。Viewerからのコールバックで更新される。
+  const [pageProgress, setPageProgress] = useState({ done: 0, total: 0 });
+  // falseの間はViewerに新規ページの処理を開始させない（「処理を中断」）。
+  const [processingEnabled, setProcessingEnabled] = useState(true);
+  const [jumpInput, setJumpInput] = useState("");
   // パス2: 文書全体の文脈推定→文脈を踏まえた全体再翻訳。
   const [documentAnalysis, setDocumentAnalysis] = useState<DocumentAnalysis | null>(null);
   const [refineStatus, setRefineStatus] = useState<
@@ -63,28 +65,69 @@ export default function PdfTranslatorApp() {
   // OCR（スキャンPDF）の平均信頼度。テキスト層抽出時はnullのまま。
   const [ocrConfidence, setOcrConfidence] = useState<number | null>(null);
   const [, startTransition] = useTransition();
+  // パス1（自動抽出/OCRトリガーの翻訳・手動領域・再翻訳）はすべて1本のコントローラで
+  // 中断管理する。ドキュメント/言語が変わったら丸ごと中断し、新しいコントローラに差し替える。
   const abortRef = useRef<AbortController | null>(null);
-  // 手動領域の翻訳は初回翻訳と独立して走らせるため、専用のコントローラで中断管理する。
-  const manualAbortRef = useRef<AbortController | null>(null);
   // パス2（文脈適応の全体再翻訳）専用のコントローラ。
   const refineAbortRef = useRef<AbortController | null>(null);
+  // llama.cppは単一インスタンスのため、複数ページぶんの翻訳リクエストが同時に
+  // 飛ばないよう、パス1の翻訳（ページ抽出/手動領域/再翻訳）は全てこのキューで直列化する。
+  const translateQueueRef = useRef<Promise<void>>(Promise.resolve());
+  // キューに積まれている（実行中含む）パス1翻訳タスクの件数。0になれば「翻訳待ちなし」。
+  const [pendingTranslateCount, setPendingTranslateCount] = useState(0);
+  // パス1翻訳の重複除去キャッシュ（原文テキスト -> 結果）。ページをまたいで同じ文字列
+  // （明細票の"Total"等）が繰り返されやすいため、ページごとにtranslateGroupsを呼んでも
+  // 重複リクエストが起きないようドキュメント単位で共有する。
+  const pass1CacheRef = useRef(new Map<string, TranslationEntry>());
+  // パス2（文脈適応翻訳）用の重複除去キャッシュ。パス2は現状1文書につき1回の呼び出しだが、
+  // パス1と対称に持たせておく。
+  const pass2CacheRef = useRef(new Map<string, TranslationEntry>());
+
   const failedCount = Object.values(translations).filter((t) => t.failed).length;
+  const totalTranslatable = extractedGroups.filter((g) => g.translatable).length;
+  const translatedCount = extractedGroups.filter(
+    (g) => g.translatable && translations[g.id] !== undefined
+  ).length;
+  const allPagesProcessed = pageProgress.total > 0 && pageProgress.done === pageProgress.total;
+  const pass1Done = allPagesProcessed && pendingTranslateCount === 0;
+  const refineTargetCount = [
+    ...extractedGroups.filter((g) => !dismissedIds.has(g.id)),
+    ...manualGroups,
+  ].filter((g) => g.translatable).length;
+
+  // パス1翻訳タスクを直列キューへ積む。同時に複数ページの翻訳リクエストが
+  // llama.cppへ飛ばないようにするための共通ヘルパー。
+  const enqueueTranslate = useCallback((task: () => Promise<void>) => {
+    setPendingTranslateCount((c) => c + 1);
+    const run = () => task().finally(() => setPendingTranslateCount((c) => Math.max(0, c - 1)));
+    const next = translateQueueRef.current.then(run, run);
+    translateQueueRef.current = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  }, []);
 
   const loadFile = useCallback(async (buffer: ArrayBuffer, name: string) => {
     abortRef.current?.abort();
-    manualAbortRef.current?.abort();
     refineAbortRef.current?.abort();
+    abortRef.current = new AbortController();
+    translateQueueRef.current = Promise.resolve();
+    pass1CacheRef.current = new Map();
+    pass2CacheRef.current = new Map();
     setData(buffer);
     setFileName(name);
     setTranslations({});
     setManualGroups([]);
     setDismissedIds(new Set());
     setExtractedGroups([]);
+    setPageProgress({ done: 0, total: 0 });
+    setProcessingEnabled(true);
+    setPendingTranslateCount(0);
     setDocumentAnalysis(null);
     setRefineStatus("idle");
     setRefineError(null);
     setSelectionMode(false);
-    setStatus("idle");
     setErrorMessage(null);
     setZoom(1);
     setLangOverride(null);
@@ -147,74 +190,77 @@ export default function PdfTranslatorApp() {
     [loadPdfFile]
   );
 
+  // ページの抽出（テキスト層/OCR）が1ページ終わるたびにViewerから呼ばれる。
+  // そのページぶんの抽出結果でextractedGroupsを差し替え（言語変更等での再抽出にも対応）、
+  // 翻訳キューへ積む。
   const handleExtracted = useCallback(
-    (groups: LineGroup[]) => {
-      setExtractedGroups(groups);
-      const controller = new AbortController();
-      abortRef.current = controller;
-      setStatus("translating");
-      setErrorMessage(null);
+    (pageIndex: number, groups: LineGroup[]) => {
+      setExtractedGroups((prev) => [
+        ...prev.filter((g) => g.pageIndex !== pageIndex),
+        ...groups,
+      ]);
+      if (groups.length === 0) return;
 
-      translateGroups(
-        groups,
-        (partial) => {
-          startTransition(() => {
-            setTranslations((prev) => ({ ...prev, ...partial }));
-          });
-        },
-        controller.signal,
-        { sourceLang }
-      )
-        .then(() => {
-          if (!controller.signal.aborted) setStatus("done");
-        })
-        .catch((e) => {
+      const controller = abortRef.current;
+      if (!controller) return;
+      enqueueTranslate(() =>
+        translateGroups(
+          groups,
+          (partial) => {
+            startTransition(() => {
+              setTranslations((prev) => ({ ...prev, ...partial }));
+            });
+          },
+          controller.signal,
+          { sourceLang, cache: pass1CacheRef.current }
+        ).catch((e) => {
           if (!controller.signal.aborted) {
-            setStatus("error");
             setErrorMessage(e instanceof Error ? e.message : String(e));
           }
-        });
+        })
+      );
     },
-    [sourceLang]
+    [sourceLang, enqueueTranslate]
   );
 
   const handleManualRegion = useCallback(
     (group: LineGroup) => {
       setManualGroups((prev) => [...prev, group]);
-      // 初回翻訳のコントローラを奪わないよう、手動領域は専用コントローラで翻訳する。
-      const controller = new AbortController();
-      manualAbortRef.current = controller;
-      translateGroups(
-        [group],
-        (partial) => {
-          startTransition(() => {
-            setTranslations((prev) => ({ ...prev, ...partial }));
-          });
-        },
-        controller.signal,
-        { sourceLang }
-      ).catch((e) => {
-        // 手動領域の翻訳失敗は致命的ではないので、原文フォールバックのまま留める。
-        if (!controller.signal.aborted) {
-          console.error("手動領域の翻訳に失敗しました:", e);
-        }
-      });
+      const controller = abortRef.current;
+      if (!controller) return;
+      enqueueTranslate(() =>
+        translateGroups(
+          [group],
+          (partial) => {
+            startTransition(() => {
+              setTranslations((prev) => ({ ...prev, ...partial }));
+            });
+          },
+          controller.signal,
+          { sourceLang, cache: pass1CacheRef.current }
+        ).catch((e) => {
+          // 手動領域の翻訳失敗は致命的ではないので、原文フォールバックのまま留める。
+          if (!controller.signal.aborted) {
+            console.error("手動領域の翻訳に失敗しました:", e);
+          }
+        })
+      );
     },
-    [sourceLang]
+    [sourceLang, enqueueTranslate]
   );
 
   const clearManualRegions = useCallback(() => {
-    manualAbortRef.current?.abort();
+    const manualIds = new Set(manualGroups.map((g) => g.id));
     setManualGroups([]);
-    // 手動グループぶんの翻訳結果（manual- 始まりのid）だけを取り除く。
+    // 手動グループぶんの翻訳結果だけを取り除く。
     setTranslations((prev) => {
       const next: Record<string, TranslationEntry> = {};
       for (const [id, entry] of Object.entries(prev)) {
-        if (!id.startsWith("manual-")) next[id] = entry;
+        if (!manualIds.has(id)) next[id] = entry;
       }
       return next;
     });
-  }, []);
+  }, [manualGroups]);
 
   const handleRetranslate = useCallback(
     (group: LineGroup) => {
@@ -224,24 +270,28 @@ export default function PdfTranslatorApp() {
         delete next[group.id];
         return next;
       });
-      const controller = new AbortController();
-      manualAbortRef.current = controller;
-      translateGroups(
-        [group],
-        (partial) => {
-          startTransition(() => {
-            setTranslations((prev) => ({ ...prev, ...partial }));
-          });
-        },
-        controller.signal,
-        { sourceLang }
-      ).catch((e) => {
-        if (!controller.signal.aborted) {
-          console.error("再翻訳に失敗しました:", e);
-        }
-      });
+      const controller = abortRef.current;
+      if (!controller) return;
+      enqueueTranslate(() =>
+        // 再翻訳は「同じキャッシュ結果をもう一度返すだけ」にならないよう、
+        // 共有キャッシュ(pass1CacheRef)を使わず必ず新規にLLMへ問い合わせる。
+        translateGroups(
+          [group],
+          (partial) => {
+            startTransition(() => {
+              setTranslations((prev) => ({ ...prev, ...partial }));
+            });
+          },
+          controller.signal,
+          { sourceLang }
+        ).catch((e) => {
+          if (!controller.signal.aborted) {
+            console.error("再翻訳に失敗しました:", e);
+          }
+        })
+      );
     },
-    [sourceLang]
+    [sourceLang, enqueueTranslate]
   );
 
   const handleRefineWithContext = useCallback(() => {
@@ -295,7 +345,7 @@ export default function PdfTranslatorApp() {
             });
           },
           controller.signal,
-          { context: analysis.summary, expert: analysis.expert, sourceLang }
+          { context: analysis.summary, expert: analysis.expert, sourceLang, cache: pass2CacheRef.current }
         ).then(() => {
           if (!controller.signal.aborted) setRefineStatus("done");
         });
@@ -333,29 +383,32 @@ export default function PdfTranslatorApp() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [data]);
 
-  const handleDismiss = useCallback((id: string) => {
-    // 翻訳結果を消し、ボックス自体も非表示にする。
-    // この後ユーザーが「OCRエリア指定」で同じ場所を囲み直せば、新しい手動グループとして再翻訳できる。
-    setTranslations((prev) => {
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
-    if (id.startsWith("manual-")) {
-      // 手動グループは配列から取り除けば非表示になる。
-      setManualGroups((prev) => prev.filter((g) => g.id !== id));
-    } else {
-      // 自動抽出グループはViewer内部のstateなので直接消せない。非表示idとして記録する。
-      setDismissedIds((prev) => {
-        const next = new Set(prev);
-        next.add(id);
+  const handleDismiss = useCallback(
+    (id: string) => {
+      // 翻訳結果を消し、ボックス自体も非表示にする。
+      // この後ユーザーが「OCRエリア指定」で同じ場所を囲み直せば、新しい手動グループとして再翻訳できる。
+      setTranslations((prev) => {
+        const next = { ...prev };
+        delete next[id];
         return next;
       });
-    }
-  }, []);
+      if (manualGroups.some((g) => g.id === id)) {
+        // 手動グループは配列から取り除けば非表示になる。
+        setManualGroups((prev) => prev.filter((g) => g.id !== id));
+      } else {
+        // 自動抽出グループはViewer内部のstateなので直接消せない。非表示idとして記録する。
+        setDismissedIds((prev) => {
+          const next = new Set(prev);
+          next.add(id);
+          return next;
+        });
+      }
+    },
+    [manualGroups]
+  );
 
   // 抽出/OCR結果から言語を推定できたときViewerから呼ばれる。自動判定は1文書に
-  // つき1回だけ採用する（OCRの判定パス→確定パスの2回目で再判定されても上書きしない）。
+  // つき1回だけ採用する（複数ページ・複数回呼ばれても上書きしない）。
   // 手動選択があればそちらが優先される（sourceLang = langOverride ?? detectedLang）ため、
   // ここでは常に detectedLang を更新してよい。
   const handleDetectedLang = useCallback((lang: SourceLang) => {
@@ -366,24 +419,40 @@ export default function PdfTranslatorApp() {
     setOcrConfidence(confidence);
   }, []);
 
+  const handlePageProgress = useCallback((done: number, total: number) => {
+    setPageProgress({ done, total });
+  }, []);
+
+  const handleJump = useCallback(() => {
+    const n = Number(jumpInput);
+    if (!Number.isInteger(n) || n < 1) return;
+    document
+      .getElementById(`pdf-page-${n}`)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [jumpInput]);
+
   // 言語を手動で切り替える（自動判定に戻す場合はnullを渡す）。
   // loadFileと同じ範囲（data/fileName/zoomは保持）を初期化し、Viewer側の
   // 再抽出・再OCRをトリガーする。以降の再翻訳は sourceLang の変更をきっかけに
   // handleExtracted 等が自動的に走る。
   const handleChangeSourceLang = useCallback((lang: SourceLang | null) => {
     abortRef.current?.abort();
-    manualAbortRef.current?.abort();
     refineAbortRef.current?.abort();
+    abortRef.current = new AbortController();
+    translateQueueRef.current = Promise.resolve();
+    pass1CacheRef.current = new Map();
+    pass2CacheRef.current = new Map();
     setLangOverride(lang);
     setDetectedLang(null);
     setOcrConfidence(null);
     setTranslations({});
     setManualGroups([]);
     setDismissedIds(new Set());
+    setPendingTranslateCount(0);
+    setProcessingEnabled(true);
     setDocumentAnalysis(null);
     setRefineStatus("idle");
     setRefineError(null);
-    setStatus("idle");
     setErrorMessage(null);
   }, []);
 
@@ -394,8 +463,8 @@ export default function PdfTranslatorApp() {
           外国語PDF 日本語オーバーレイ翻訳
         </h1>
         <p className="text-sm text-zinc-600 dark:text-zinc-400">
-          ベトナム語・英語・ミャンマー語のPDFを読み込むと、常駐中のローカルLLM（llama.cpp /
-          gemma-4-12b）が日本語に翻訳し、元のレイアウトの上に重ねて表示します。
+          ベトナム語・英語・ミャンマー語のPDF（複数ページ対応）を読み込むと、常駐中のローカルLLM
+          （llama.cpp / gemma-4-12b）が日本語に翻訳し、元のレイアウトの上に重ねて表示します。
           原文の言語は自動判定されますが、下の「原文の言語」から手動でも選べます。
         </p>
 
@@ -426,17 +495,29 @@ export default function PdfTranslatorApp() {
         {fileName && (
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
             読み込み中: {fileName}
-            {status === "translating" && " ・翻訳中…"}
-            {status === "done" && failedCount === 0 && " ・翻訳完了"}
-            {status === "done" &&
+            {pageProgress.total > 0 && (
+              <>
+                {" "}
+                ・解析 {pageProgress.done}/{pageProgress.total}ページ
+              </>
+            )}
+            {totalTranslatable > 0 && (
+              <>
+                {" "}
+                ・翻訳 {translatedCount}/{totalTranslatable}件
+              </>
+            )}
+            {!processingEnabled && !allPagesProcessed && " ・処理を中断中"}
+            {pass1Done && failedCount === 0 && " ・翻訳完了"}
+            {pass1Done &&
               failedCount > 0 &&
               ` ・翻訳完了（${failedCount}件はローカルLLMの応答が得られず原文のままです。オレンジ色の枠が対象です）`}
-            {status === "error" && ` ・翻訳エラー: ${errorMessage}`}
+            {errorMessage && ` ・エラー: ${errorMessage}`}
           </p>
         )}
 
         {data && (
-          <div className="flex items-center gap-2 text-sm">
+          <div className="flex flex-wrap items-center gap-2 text-sm">
             <span className="text-zinc-500 dark:text-zinc-400">表示倍率:</span>
             <button
               type="button"
@@ -464,6 +545,41 @@ export default function PdfTranslatorApp() {
             >
               リセット
             </button>
+
+            {pageProgress.total > 0 && (
+              <>
+                <span className="ml-4 text-zinc-500 dark:text-zinc-400">ページ移動:</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={pageProgress.total}
+                  value={jumpInput}
+                  onChange={(e) => setJumpInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleJump();
+                  }}
+                  placeholder={`1〜${pageProgress.total}`}
+                  className="w-20 rounded border border-black/[.15] px-2 py-1 text-xs dark:border-white/[.15] dark:bg-transparent"
+                />
+                <button
+                  type="button"
+                  onClick={handleJump}
+                  className="rounded border border-black/[.15] px-2 py-1 text-xs hover:bg-black/[.04] dark:border-white/[.15] dark:hover:bg-[#1a1a1a]"
+                >
+                  移動
+                </button>
+              </>
+            )}
+
+            {!allPagesProcessed && (
+              <button
+                type="button"
+                onClick={() => setProcessingEnabled((v) => !v)}
+                className="ml-auto rounded-full border border-black/[.15] px-4 py-1.5 text-sm font-medium hover:bg-black/[.04] dark:border-white/[.15] dark:hover:bg-[#1a1a1a]"
+              >
+                {processingEnabled ? "処理を中断" : "処理を再開"}
+              </button>
+            )}
           </div>
         )}
 
@@ -530,7 +646,7 @@ export default function PdfTranslatorApp() {
           </div>
         )}
 
-        {data && (status === "done" || refineStatus !== "idle") && (
+        {data && (pass1Done || refineStatus !== "idle") && (
           <div className="flex flex-col gap-2 rounded-lg border border-blue-200 bg-blue-50 p-3 dark:border-blue-900 dark:bg-blue-950/30">
             <div className="flex flex-wrap items-center gap-3">
               <button
@@ -543,10 +659,10 @@ export default function PdfTranslatorApp() {
                   ? "文書の文脈を推定中…"
                   : refineStatus === "refining"
                     ? "文脈を踏まえて再翻訳中…"
-                    : "文脈を踏まえて全体を再翻訳"}
+                    : `文脈を踏まえて全体を再翻訳（対象 ${refineTargetCount}件）`}
               </button>
               <span className="text-xs text-blue-800 dark:text-blue-300">
-                単語ごとの独立翻訳を、文書全体の文脈を踏まえて見直します
+                単語ごとの独立翻訳を、文書全体の文脈を踏まえて見直します（件数が多いと数分かかります）
               </span>
             </div>
             {documentAnalysis && (
@@ -601,6 +717,8 @@ export default function PdfTranslatorApp() {
             dismissedIds={dismissedIds}
             onRetranslate={handleRetranslate}
             onDismiss={handleDismiss}
+            processingEnabled={processingEnabled}
+            onPageProgress={handlePageProgress}
           />
         ) : (
           <div

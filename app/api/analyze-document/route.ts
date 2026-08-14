@@ -22,9 +22,20 @@ const SOURCE_LANG_LABELS: Record<SourceLang, string> = {
   mya: "ミャンマー語",
 };
 
+/**
+ * 文書全体からMAX_SAMPLE_LINES行を等間隔に間引いてサンプリングする。
+ * 先頭から単純にslice(0, N)すると、複数ページPDFでは実質1〜2ページ目しか
+ * 文脈推定に反映されない（例: 14ページ500行中の先頭60行＝表紙と2ページ目のみ）。
+ * 全ページから均等に取ることで、文書全体を俯瞰した推定に近づける。
+ */
+function sampleLines(lines: string[]): string[] {
+  if (lines.length <= MAX_SAMPLE_LINES) return lines;
+  const step = lines.length / MAX_SAMPLE_LINES;
+  return Array.from({ length: MAX_SAMPLE_LINES }, (_, i) => lines[Math.floor(i * step)]);
+}
+
 function buildPrompt(lines: string[], sourceLang?: SourceLang): string {
-  const sample = lines
-    .slice(0, MAX_SAMPLE_LINES)
+  const sample = sampleLines(lines)
     .map((l) => l.slice(0, MAX_CHARS_PER_LINE))
     .join("\n");
   const langLabel = sourceLang ? SOURCE_LANG_LABELS[sourceLang] : "外国語";
