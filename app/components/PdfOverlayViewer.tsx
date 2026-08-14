@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type * as PdfjsNS from "pdfjs-dist";
+import type { PDFPageProxy } from "pdfjs-dist";
+import PdfPageView, { type PdfPageStatus, type RenderablePage } from "./PdfPageView";
 import { detectSourceLang, groupTextItems, loadPdfjs } from "@/app/lib/pdf";
 import { runOcr, runOcrRegion } from "@/app/lib/ocr";
-import { diffChars } from "@/app/lib/diff";
 import type { Box, LineGroup, SourceLang, TranslationEntry } from "@/app/lib/types";
 
 type Props = {
@@ -15,8 +17,12 @@ type Props = {
   showTranslation: boolean;
   /** 表示倍率。1 が等倍。 */
   zoom: number;
-  /** 抽出したテキストグループを親へ通知（翻訳リクエストのトリガー用） */
-  onExtracted: (groups: LineGroup[]) => void;
+  /**
+   * あるページの抽出（テキスト層/OCR）が終わるたびに、そのページぶんのグループを親へ通知する。
+   * groupsが空（文字を検出できなかったページ）の場合も呼ばれる — 親側で「そのページ分の
+   * 古い抽出結果を消す」判断ができるよう、pageIndexは常に明示的に渡す。
+   */
+  onExtracted: (pageIndex: number, groups: LineGroup[]) => void;
   /**
    * 原文の言語。手動選択されていれば確定値、未選択かつ自動判定済みなら推定値、
    * どちらもまだなら null（OCR時は判定兼用の複数言語同時読みになる）。
@@ -38,42 +44,69 @@ type Props = {
   onRetranslate: (group: LineGroup) => void;
   /** 失敗ボックスの「削除」ボタンが押されたとき、対象idを親へ通知 */
   onDismiss: (id: string) => void;
+  /** falseの間は新規ページの処理（テキスト抽出/OCR）を開始しない（「処理を中断」）。表示・手動操作は継続できる。 */
+  processingEnabled: boolean;
+  /** ページ単位の処理進捗。done: 処理済みページ数、total: 全ページ数。 */
+  onPageProgress?: (done: number, total: number) => void;
 };
 
 const SCALE = 1.5;
 // OCRは低解像度だと精度が大きく落ちるため、表示用よりも高い解像度で別途レンダリングする。
 const OCR_SCALE = 3;
-// 誤クリックを手動選択として扱わないための最小サイズ（表示座標px）。
-const MIN_SELECTION_PX = 8;
+// sourceLang未確定時に判定兼用OCRを試みる最大ページ数。これを超えたら中立(null)のまま本処理へ進む。
+const PROBE_MAX_PAGES = 3;
 
-// pdfjsのPDFPageProxyのうち、このコンポーネントで使う部分だけを構造的に表した型。
-// 型は動的importで得られるため、必要なメソッドのみを最小限で宣言する。
-type RenderablePage = {
-  getViewport(params: { scale: number }): { width: number; height: number };
-  render(params: {
-    canvas: HTMLCanvasElement;
-    canvasContext: CanvasRenderingContext2D;
-    viewport: { width: number; height: number };
-  }): { promise: Promise<void> };
-};
+// pdfjsのpage.render()は、ページの内容（CCITT/JBIG2等の圧縮フォーマットや解像度の組み合わせ）
+// によっては、canvasやページ番号に関係なくPromiseが解決も拒否もされず無期限に応答しなくなる
+// ことが実機で確認されている（本アプリのコードとは独立に、pdfjs-dist単体の再現テストで特定済み）。
+// 1ページのこの種の不具合でドキュメント全体の処理が止まらないよう、明示的なタイムアウトで
+// 打ち切り、失敗として次のページへ進めるようにする。
+const RENDER_TIMEOUT_MS = 45_000;
 
-type DragState = { startX: number; startY: number; curX: number; curY: number };
-
-function normalizeRect(d: DragState): Box {
-  return {
-    left: Math.min(d.startX, d.curX),
-    top: Math.min(d.startY, d.curY),
-    width: Math.abs(d.curX - d.startX),
-    height: Math.abs(d.curY - d.startY),
-    angle: 0,
-  };
-}
-
-// aの中心がbの矩形内に入っているか（表示座標）。
-function centerInside(a: Box, b: Box): boolean {
-  const cx = a.left + a.width / 2;
-  const cy = a.top + a.height / 2;
-  return cx >= b.left && cx <= b.left + b.width && cy >= b.top && cy <= b.top + b.height;
+// 高解像度（OCR_SCALE等）でページ全体をcanvasへ描画する。呼び出し側は使い終わったら
+// canvas.width = canvas.height = 0 にしてピクセルバッファを解放すること（多ページで蓄積させない）。
+//
+// onCancelRegistered は、呼び出し元（effectのクリーンアップ等）が「この描画を今すぐ中断したい」
+// ときに使うcancel関数を受け取るコールバック。React StrictMode（開発時）はeffectを一度
+// 破棄→再実行するため、破棄された側のasync関数はawaitの続きが実行され続ける。もし
+// renderPageToCanvasにこの仕組みが無いと、破棄されたはずの古い呼び出しと新しい呼び出しが
+// 同じPDFPageProxyに対して同時にrender()し、pdfjs側が無応答になる（実機で再現・特定済み）。
+// クリーンアップ時に即座にcancel()できるようにして、この競合を防ぐ。
+async function renderPageToCanvas(
+  page: PDFPageProxy,
+  scale: number,
+  onCancelRegistered?: (cancel: () => void) => () => void
+): Promise<HTMLCanvasElement> {
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("canvasコンテキストの取得に失敗しました");
+  const renderTask = page.render({ canvas, canvasContext: ctx, viewport });
+  const unregister = onCancelRegistered?.(() => renderTask.cancel());
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      renderTask.promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          // pdfjs側が応答しなくなっているケースではcancel()自体も効かないことがあるが、
+          // 効く場合に備えて一応呼んでおく。
+          renderTask.cancel();
+          reject(
+            new Error(`ページの描画が${RENDER_TIMEOUT_MS / 1000}秒以内に完了しませんでした`)
+          );
+        }, RENDER_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    // 完了/失敗いずれの場合も、effectクリーンアップ側の中断対象リストから外す
+    // （でないと完了済みタスクのcancel()参照がクリーンアップまで残り続ける）。
+    unregister?.();
+  }
+  return canvas;
 }
 
 export default function PdfOverlayViewer({
@@ -91,180 +124,325 @@ export default function PdfOverlayViewer({
   dismissedIds,
   onRetranslate,
   onDismiss,
+  processingEnabled,
+  onPageProgress,
 }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [groups, setGroups] = useState<LineGroup[]>([]);
-  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
+  const pdfjsRef = useRef<typeof PdfjsNS | null>(null);
+  // 効果（effect）・コールバック内部からの参照用。refなのでレンダー中には読まない
+  // （JSXでページproxyを渡す先はpagesStateの方を使う。Reactのrefルール対応）。
+  const pagesRef = useRef<PDFPageProxy[]>([]);
+  // pagesRefと常に同じ中身を指す、レンダー（JSX）用のstate。
+  const [pagesState, setPagesState] = useState<PDFPageProxy[]>([]);
+  // OCR・テキスト抽出専用の、pagesRefとは別のドキュメントインスタンスのページ。
+  // pdfjsは同一ページproxyに対する複数の同時render()呼び出しを想定しておらず、
+  // 画面表示側（PdfPageViewの遅延描画・画面外での中断）とOCR側の高解像度描画が
+  // 同じproxyを取り合うとrender()が解決しなくなる（実機で再現・特定済み）。
+  // ドキュメントを2回読み込み、描画対象を完全に分離することで回避する。
+  const ocrPagesRef = useRef<PDFPageProxy[]>([]);
+  const [numPages, setNumPages] = useState(0);
+  const [pageViewportSizes, setPageViewportSizes] = useState<
+    { width: number; height: number }[]
+  >([]);
   const [error, setError] = useState<string | null>(null);
-  const [ocrRunning, setOcrRunning] = useState(false);
-  // "probe": 言語未確定での判定兼用パス（この後、確定言語で読み直しが発生する）。
-  // "final": 確定した言語（手動選択 or 判定済み）でのOCR。
-  const [ocrPhase, setOcrPhase] = useState<"probe" | "final">("final");
+  // effect 1（ドキュメント読込）完了のたびにインクリメントし、effect 2b（処理ループ）を起動するトリガー。
+  const [docToken, setDocToken] = useState(0);
 
-  // 手動OCR領域指定まわり
-  const pageRef = useRef<RenderablePage | null>(null);
-  // 手動選択・自動OCRの両方で使う高解像度フルページcanvas。
-  // ドキュメント（data）が変わるたびに破棄し、初回アクセス時に一度だけ生成してキャッシュする。
-  const ocrCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // ページ番号(1始まり) -> 抽出済みグループ／処理状態。
+  const [pageGroups, setPageGroups] = useState<Record<number, LineGroup[]>>({});
+  const [pageStatus, setPageStatus] = useState<Record<number, PdfPageStatus>>({});
+  // 現在OCRを実行中のページ（あれば）。バナー表示に使う。
+  const [activeOcr, setActiveOcr] = useState<{ pageIndex: number; phase: "probe" | "final" } | null>(
+    null
+  );
+
+  // ページごとのテキスト層抽出結果キャッシュ。言語に依存しないため一度判定したら使い回す。
+  // undefined=未判定、null=テキスト層なし（OCR対象と確定）、配列=テキスト層あり。
+  const textLayerGroupsRef = useRef<Record<number, LineGroup[] | null | undefined>>({});
+  // 処理（テキスト抽出/OCR）が完了したページ番号の集合。中断→再開でやり直さないために使う。
+  const processedRef = useRef<Set<number>>(new Set());
+  // sourceLang未確定のままPROBE_MAX_PAGES試して判定できなかった場合、以後は再判定を
+  // 試みない（中断→再開のたびに無駄なprobe OCRをやり直さないため）。
+  const probeExhaustedRef = useRef(false);
+
+  // 手動領域OCR用の高解像度canvasキャッシュ。全ページぶん保持するとメモリを圧迫するため
+  // 直近に触った1ページぶんだけ保持し、別ページを触ったら差し替える。
+  const ocrCanvasCacheRef = useRef<{ pageIndex: number; canvas: HTMLCanvasElement } | null>(null);
   const manualIdRef = useRef(0);
-  const selectionLayerRef = useRef<HTMLDivElement>(null);
-  const [drag, setDrag] = useState<DragState | null>(null);
-  const [regionOcrRunning, setRegionOcrRunning] = useState(false);
-  const [regionError, setRegionError] = useState<string | null>(null);
+  const [regionOcr, setRegionOcr] = useState<{ pageIndex: number } | null>(null);
+  const [regionError, setRegionError] = useState<{ pageIndex: number; message: string } | null>(
+    null
+  );
 
-  // effect 1（PDF読込・描画・テキスト層抽出）の結果を effect 2（言語依存の
-  // 抽出確定・OCR）へ橋渡しするref。テキスト層があれば抽出済みグループを、
-  // 無ければ null を入れる（= OCRが必要という合図）。
-  const textLayerGroupsRef = useRef<LineGroup[] | null>(null);
-  // effect 1完了のたびにインクリメントし、effect 2を起動するトリガー。
-  const [pageToken, setPageToken] = useState(0);
-
-  // effect 1: PDFの読込・canvas描画・テキスト層抽出。dataが変わったときだけ実行する。
-  // 言語（sourceLang）はここでは使わない — テキスト層があるPDFなら抽出結果は言語に
-  // 依存しないため、言語変更のたびにPDFを再パース・再描画する必要はない。
+  // effect 1: ドキュメント読込。dataが変わるたびに全ページのproxyとサイズだけ先に取得する
+  // （getPage自体は軽い。実際のcanvas描画・テキスト抽出はページごとにeffect 2bで行う）。
   useEffect(() => {
     let cancelled = false;
 
-    async function render() {
+    async function load() {
       setError(null);
-      setGroups([]);
+      setNumPages(0);
+      setPageViewportSizes([]);
+      setPageGroups({});
+      setPageStatus({});
+      setActiveOcr(null);
       onOcrConfidence?.(null);
+      pagesRef.current = [];
+      setPagesState([]);
+      ocrPagesRef.current = [];
+      textLayerGroupsRef.current = {};
+      processedRef.current = new Set();
+      probeExhaustedRef.current = false;
+      if (ocrCanvasCacheRef.current) {
+        ocrCanvasCacheRef.current.canvas.width = 0;
+        ocrCanvasCacheRef.current.canvas.height = 0;
+        ocrCanvasCacheRef.current = null;
+      }
+      manualIdRef.current = 0;
+
       try {
         const pdfjs = await loadPdfjs();
-        // getDocument は渡した ArrayBuffer を detach/transfer することがあるため複製して渡す
-        const doc = await pdfjs.getDocument({
-          data: data.slice(0),
+        pdfjsRef.current = pdfjs;
+        const docOptions = {
           cMapUrl: "/cmaps/",
           cMapPacked: true,
           standardFontDataUrl: "/standard_fonts/",
-          // JBIG2/JPX/ICC のデコードに使うwasm。未指定だとスキャンPDF（JBIG2圧縮の
-          // 白黒画像等）で Jbig2Error が発生し、画像マスクが丸ごと破棄されて
-          // canvasに何も描画されない（末尾スラッシュ必須。無いとpdfjs側で例外になる）。
+          // JBIG2/JPX/ICC のデコードに使うwasm。未指定だとスキャンPDFでJbig2Errorが発生し、
+          // 画像マスクが丸ごと破棄されてcanvasに何も描画されない（末尾スラッシュ必須）。
           wasmUrl: "/wasm/",
-        }).promise;
-
-        const page = await doc.getPage(1);
-        // 手動領域OCRで再利用するためページを保持し、前のドキュメントの高解像度キャッシュは破棄する。
-        pageRef.current = page as unknown as RenderablePage;
-        ocrCanvasRef.current = null;
-        const viewport = page.getViewport({ scale: SCALE });
-
+        };
+        // getDocument は渡した ArrayBuffer を detach/transfer することがあるため複製して渡す。
+        // 画面表示用とOCR用で完全に独立した2つのドキュメントインスタンスを読み込む
+        // （ocrPagesRef宣言部のコメント参照。render()の同時呼び出し衝突を避けるため）。
+        const [doc, ocrDoc] = await Promise.all([
+          pdfjs.getDocument({ ...docOptions, data: data.slice(0) }).promise,
+          pdfjs.getDocument({ ...docOptions, data: data.slice(0) }).promise,
+        ]);
         if (cancelled) return;
 
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-
-        canvas.width = Math.floor(viewport.width);
-        canvas.height = Math.floor(viewport.height);
-        setViewportSize({ width: viewport.width, height: viewport.height });
-
-        await page.render({ canvas, canvasContext: ctx, viewport }).promise;
-        if (cancelled) return;
-
-        const textContent = await page.getTextContent();
-        if (cancelled) return;
-
-        const extracted = groupTextItems(pdfjs, textContent.items, viewport);
-
-        if (extracted.length > 0) {
-          // テキスト層がある。OCRは不要。抽出結果から言語を推定できれば通知する
-          // （数字・記号だけのグループを分母に含めると比率が薄まるため、
-          //  isTranslatable を通ったグループのテキストだけをサンプルにする）。
-          const sample = extracted
-            .filter((g) => g.translatable)
-            .map((g) => g.text)
-            .join(" ");
-          const detected = detectSourceLang(sample);
-          if (detected) onDetectedLang(detected);
-          textLayerGroupsRef.current = extracted;
-        } else {
-          // テキスト層が存在しない（スキャン/画像ベースの）PDF。OCRは
-          // effect 2（言語に応じて内容が変わる）側で行う。
-          textLayerGroupsRef.current = null;
+        const pages: PDFPageProxy[] = [];
+        const ocrPages: PDFPageProxy[] = [];
+        const sizes: { width: number; height: number }[] = [];
+        for (let n = 1; n <= doc.numPages; n++) {
+          const [page, ocrPage] = await Promise.all([doc.getPage(n), ocrDoc.getPage(n)]);
+          if (cancelled) return;
+          pages.push(page);
+          ocrPages.push(ocrPage);
+          const vp = page.getViewport({ scale: SCALE });
+          sizes.push({ width: vp.width, height: vp.height });
         }
-
         if (cancelled) return;
-        setPageToken((t) => t + 1);
+
+        pagesRef.current = pages;
+        setPagesState(pages);
+        ocrPagesRef.current = ocrPages;
+        setPageViewportSizes(sizes);
+        setNumPages(doc.numPages);
+        setDocToken((t) => t + 1);
       } catch (e) {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : String(e));
-        }
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
     }
 
-    render();
+    load();
     return () => {
       cancelled = true;
     };
-  }, [data, onDetectedLang, onOcrConfidence]);
+  }, [data, onOcrConfidence]);
 
-  // effect 2: 言語が確定/変更されるたびに、抽出結果を確定させる。
-  // テキスト層がある文書はキャッシュ済みのグループをそのまま再送するだけ（再抽出なし）。
-  // テキスト層が無い文書はOCRを（再）実行する。
+  // effect 2a: sourceLangが変化したら、OCR依存（テキスト層なし）で処理済みのページだけを
+  // 再処理対象に戻す。テキスト層があるページは言語に依存しないため触らない。
   useEffect(() => {
-    if (pageToken === 0) return; // effect 1がまだ一度も完了していない
-    let cancelled = false;
+    const ocrPageIndexes = Object.entries(textLayerGroupsRef.current)
+      .filter(([, v]) => v === null)
+      .map(([k]) => Number(k));
+    if (ocrPageIndexes.length === 0) return;
 
-    async function resolveGroups() {
-      const cached = textLayerGroupsRef.current;
+    let changed = false;
+    for (const n of ocrPageIndexes) {
+      if (processedRef.current.delete(n)) changed = true;
+    }
+    if (!changed) return;
+
+    setPageGroups((prev) => {
+      const next = { ...prev };
+      for (const n of ocrPageIndexes) delete next[n];
+      return next;
+    });
+    setPageStatus((prev) => {
+      const next = { ...prev };
+      for (const n of ocrPageIndexes) next[n] = "pending";
+      return next;
+    });
+  }, [sourceLang]);
+
+  // effect 2b: ページ順次処理ループ。1ページ目から順にテキスト抽出/OCRを行い、
+  // 終わったページから親へ通知する。processingEnabled=falseの間は新規開始しない（中断）。
+  useEffect(() => {
+    if (docToken === 0) return;
+    if (!processingEnabled) return;
+    let cancelled = false;
+    // このeffectインスタンスが今まさに開始した描画のcancel関数を集めておく。
+    // React StrictMode（開発時）はeffectを一度破棄→再実行するため、cleanup時に
+    // ここへ集めたcancel()を即座に呼ばないと、破棄後もawaitの続きが動き続け、
+    // 新しいeffectインスタンスと同じPDFPageProxyへ同時にrender()してしまう
+    // （pdfjs側が無応答になる不具合を実機で確認済み）。
+    const pendingRenderCancels = new Set<() => void>();
+    function registerRenderCancel(cancel: () => void): () => void {
+      if (cancelled) {
+        cancel();
+        return () => {};
+      }
+      pendingRenderCancels.add(cancel);
+      return () => pendingRenderCancels.delete(cancel);
+    }
+
+    // 判定兼用OCR（sourceLang未確定時のprobeフェーズ専用）。結果は公開せず、
+    // 検出できた言語だけを返す（捨てる予定のこの結果は翻訳へ回さない＝LLM呼び出しの二重化を防ぐ）。
+    async function probePage(n: number): Promise<SourceLang | null> {
+      // OCR専用ドキュメントのページを使う（画面表示用のpagesRefとは描画を分離する）。
+      const page = ocrPagesRef.current[n - 1];
+      if (textLayerGroupsRef.current[n] === undefined) {
+        const viewport = page.getViewport({ scale: SCALE });
+        const textContent = await page.getTextContent();
+        const extracted = groupTextItems(pdfjsRef.current!, textContent.items, viewport, n);
+        textLayerGroupsRef.current[n] = extracted.length > 0 ? extracted : null;
+      }
+      const textGroups = textLayerGroupsRef.current[n];
+      if (textGroups) {
+        const sample = textGroups
+          .filter((g) => g.translatable)
+          .map((g) => g.text)
+          .join(" ");
+        return detectSourceLang(sample);
+      }
+
+      setActiveOcr({ pageIndex: n, phase: "probe" });
+      try {
+        const canvas = await renderPageToCanvas(page, OCR_SCALE, registerRenderCancel);
+        const result = await runOcr(canvas, SCALE / OCR_SCALE, null, n);
+        canvas.width = 0;
+        canvas.height = 0;
+        return result.detected;
+      } finally {
+        setActiveOcr((prev) => (prev?.pageIndex === n ? null : prev));
+      }
+    }
+
+    // 1ページぶんの本処理（テキスト層抽出 or OCR）。結果をpageGroupsへ格納し、
+    // 親へonExtractedで通知して翻訳を開始させる。
+    async function processPage(n: number): Promise<void> {
+      setPageStatus((prev) => ({ ...prev, [n]: "processing" }));
+      // OCR専用ドキュメントのページを使う（画面表示用のpagesRefとは描画を分離する）。
+      const page = ocrPagesRef.current[n - 1];
+
+      let cached = textLayerGroupsRef.current[n];
+      if (cached === undefined) {
+        const viewport = page.getViewport({ scale: SCALE });
+        const textContent = await page.getTextContent();
+        const extracted = groupTextItems(pdfjsRef.current!, textContent.items, viewport, n);
+        cached = extracted.length > 0 ? extracted : null;
+        textLayerGroupsRef.current[n] = cached;
+      }
+
       if (cached) {
-        setGroups(cached);
-        onExtracted(cached);
+        // テキスト層がある。OCRは不要。
+        setPageGroups((prev) => ({ ...prev, [n]: cached }));
+        onExtracted(n, cached);
+        const sample = cached
+          .filter((g) => g.translatable)
+          .map((g) => g.text)
+          .join(" ");
+        const detected = detectSourceLang(sample);
+        if (detected && sourceLang === null) onDetectedLang(detected);
+        setPageStatus((prev) => ({ ...prev, [n]: "done" }));
         return;
       }
 
-      const page = pageRef.current;
-      if (!page) return;
-      // sourceLangがnullの時点で始めるOCRは「判定兼用の1パス目」。
-      // バナー文言を分けて、これから読み直しが発生しうることを伝える。
-      setOcrPhase(sourceLang === null ? "probe" : "final");
-      setOcrRunning(true);
+      // テキスト層が存在しない（スキャン/画像ベースの）ページ。OCRする。
+      setActiveOcr({ pageIndex: n, phase: sourceLang === null ? "probe" : "final" });
       try {
-        // フルページを高解像度で描いたcanvasをキャッシュ（初回のみ生成、手動領域OCRとも共有）。
-        let full = ocrCanvasRef.current;
-        if (!full) {
-          const ocrViewport = page.getViewport({ scale: OCR_SCALE });
-          full = document.createElement("canvas");
-          full.width = Math.floor(ocrViewport.width);
-          full.height = Math.floor(ocrViewport.height);
-          const ocrCtx = full.getContext("2d");
-          if (!ocrCtx) return;
-          await page.render({
-            canvas: full,
-            canvasContext: ocrCtx,
-            viewport: ocrViewport,
-          }).promise;
-          if (cancelled) return;
-          ocrCanvasRef.current = full;
-        }
+        const canvas = await renderPageToCanvas(page, OCR_SCALE, registerRenderCancel);
+        const result = await runOcr(canvas, SCALE / OCR_SCALE, sourceLang, n);
+        canvas.width = 0;
+        canvas.height = 0;
 
-        const result = await runOcr(full, SCALE / OCR_SCALE, sourceLang);
-        if (cancelled) return;
-
-        if (sourceLang === null && result.detected) {
-          // 判定専用パス（PROBE_LANGSでの多言語同時OCR）。検出した言語が
-          // 親に伝わると sourceLang が確定し、このeffectが確定言語で再実行される。
-          // 捨てる予定のこの結果は翻訳へ回さない（LLM呼び出しが二重になるため）。
-          onDetectedLang(result.detected);
-          return;
-        }
-
-        setGroups(result.groups);
-        onExtracted(result.groups);
-        if (result.detected) onDetectedLang(result.detected);
+        setPageGroups((prev) => ({ ...prev, [n]: result.groups }));
+        onExtracted(n, result.groups);
+        if (result.detected && sourceLang === null) onDetectedLang(result.detected);
         onOcrConfidence?.(result.confidence);
+        setPageStatus((prev) => ({ ...prev, [n]: "done" }));
       } finally {
-        if (!cancelled) setOcrRunning(false);
+        setActiveOcr((prev) => (prev?.pageIndex === n ? null : prev));
       }
     }
 
-    void resolveGroups();
+    async function run() {
+      const total = pagesRef.current.length;
+      if (total === 0) return;
+      onPageProgress?.(processedRef.current.size, total);
+
+      if (sourceLang === null && !probeExhaustedRef.current) {
+        const probeLimit = Math.min(PROBE_MAX_PAGES, total);
+        for (let n = 1; n <= probeLimit; n++) {
+          if (cancelled) return;
+          let detected: SourceLang | null = null;
+          try {
+            detected = await probePage(n);
+          } catch (e) {
+            // このページの判定は失敗として次の候補ページへ進む（判定兼用OCRなので
+            // 失敗しても本処理には影響しない）。cancelled後（effect破棄後）に
+            // 解決した古い呼び出しの場合はもうこのインスタンスの仕事ではないため何もしない。
+            if (!cancelled) console.error(`ページ${n}の言語判定に失敗しました:`, e);
+          }
+          if (cancelled) return;
+          if (detected) {
+            onDetectedLang(detected);
+            return; // sourceLang確定によりこのeffectが再実行される
+          }
+        }
+        probeExhaustedRef.current = true;
+      }
+
+      for (let n = 1; n <= total; n++) {
+        if (cancelled) return;
+        if (processedRef.current.has(n)) continue;
+        try {
+          await processPage(n);
+        } catch (e) {
+          // 1ページの抽出/OCR失敗でドキュメント全体の処理を止めない。
+          // このページはあきらめて「処理失敗」表示のまま次のページへ進む。cancelled後
+          // （effect破棄後）に解決した古い呼び出しの場合はもうこのインスタンスの仕事ではない。
+          if (!cancelled) {
+            console.error(`ページ${n}の処理に失敗しました:`, e);
+            setPageStatus((prev) => ({ ...prev, [n]: "error" }));
+            setActiveOcr((prev) => (prev?.pageIndex === n ? null : prev));
+          }
+        }
+        if (cancelled) return;
+        processedRef.current.add(n);
+        onPageProgress?.(processedRef.current.size, total);
+      }
+    }
+
+    run();
     return () => {
       cancelled = true;
+      // 進行中の描画があれば即座に中断する。放置すると、React StrictMode
+      // （開発時のeffect二重実行）や中断→再開等でこのeffectが破棄された後も
+      // render()が完了するまでawaitの続きが動き続け、新しいeffectインスタンスの
+      // render()と同じPDFPageProxyを取り合って無応答になる（実機で再現・特定済み）。
+      for (const cancel of pendingRenderCancels) cancel();
+      pendingRenderCancels.clear();
     };
-  }, [pageToken, sourceLang, onExtracted, onDetectedLang, onOcrConfidence]);
+  }, [
+    docToken,
+    sourceLang,
+    processingEnabled,
+    onExtracted,
+    onDetectedLang,
+    onOcrConfidence,
+    onPageProgress,
+  ]);
 
   // 「文字を検出できませんでした」等の一時メッセージは数秒で自動的に消す。
   useEffect(() => {
@@ -273,332 +451,114 @@ export default function PdfOverlayViewer({
     return () => clearTimeout(t);
   }, [regionError]);
 
-  // マウスのclient座標を表示座標（SCALE空間・ズーム前）へ変換する。
-  // 選択レイヤーはCSS transform: scale(zoom) された内側divの中にあるため、
-  // getBoundingClientRect はズーム込みの実寸を返す。zoomで割ってズーム前の座標に戻す。
-  function toDisplay(e: React.MouseEvent): { x: number; y: number } {
-    const rect = selectionLayerRef.current?.getBoundingClientRect();
-    if (!rect) return { x: 0, y: 0 };
-    return { x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom };
-  }
+  // 手動指定領域のOCR。ページ単位で高解像度canvasを直近1枚だけキャッシュして使い回す。
+  const handleManualSelection = useCallback(
+    async (pageIndex: number, sel: Box) => {
+      // OCR専用ドキュメントのページを使う（画面表示用のpagesRefとは描画を分離する）。
+      const page = ocrPagesRef.current[pageIndex - 1];
+      if (!page) return;
+      setRegionError(null);
+      setRegionOcr({ pageIndex });
+      try {
+        const cache = ocrCanvasCacheRef.current;
+        let full: HTMLCanvasElement;
+        if (cache && cache.pageIndex === pageIndex) {
+          full = cache.canvas;
+        } else {
+          if (cache) {
+            cache.canvas.width = 0;
+            cache.canvas.height = 0;
+          }
+          full = await renderPageToCanvas(page, OCR_SCALE);
+          ocrCanvasCacheRef.current = { pageIndex, canvas: full };
+        }
 
-  function handleSelectionDown(e: React.MouseEvent) {
-    if (!selectionMode) return;
-    e.preventDefault();
-    setRegionError(null);
-    const p = toDisplay(e);
-    setDrag({ startX: p.x, startY: p.y, curX: p.x, curY: p.y });
-  }
+        // 表示座標 → 高解像度canvasのピクセル座標（×OCR_SCALE/SCALE）。canvas範囲内にクランプする。
+        const ratio = OCR_SCALE / SCALE;
+        const sx = Math.max(0, Math.floor(sel.left * ratio));
+        const sy = Math.max(0, Math.floor(sel.top * ratio));
+        const sw = Math.min(full.width - sx, Math.ceil(sel.width * ratio));
+        const sh = Math.min(full.height - sy, Math.ceil(sel.height * ratio));
+        if (sw <= 0 || sh <= 0) return;
 
-  function handleSelectionMove(e: React.MouseEvent) {
-    if (!drag) return;
-    const p = toDisplay(e);
-    setDrag((d) => (d ? { ...d, curX: p.x, curY: p.y } : d));
-  }
+        const crop = document.createElement("canvas");
+        crop.width = sw;
+        crop.height = sh;
+        const cctx = crop.getContext("2d");
+        if (!cctx) throw new Error("canvasコンテキストの取得に失敗しました");
+        cctx.drawImage(full, sx, sy, sw, sh, 0, 0, sw, sh);
 
-  function handleSelectionUp() {
-    if (!drag) return;
-    const sel = normalizeRect(drag);
-    setDrag(null);
-    if (sel.width < MIN_SELECTION_PX || sel.height < MIN_SELECTION_PX) return;
-    void runRegionOcr(sel);
-  }
-
-  async function runRegionOcr(sel: Box) {
-    const page = pageRef.current;
-    if (!page) return;
-    setRegionError(null);
-    setRegionOcrRunning(true);
-    try {
-      // フルページを高解像度で描いたcanvasをキャッシュ（初回のみ生成）。
-      let full = ocrCanvasRef.current;
-      if (!full) {
-        const vp = page.getViewport({ scale: OCR_SCALE });
-        full = document.createElement("canvas");
-        full.width = Math.floor(vp.width);
-        full.height = Math.floor(vp.height);
-        const fctx = full.getContext("2d");
-        if (!fctx) throw new Error("canvasコンテキストの取得に失敗しました");
-        await page.render({ canvas: full, canvasContext: fctx, viewport: vp }).promise;
-        ocrCanvasRef.current = full;
+        const id = `p${pageIndex}-manual-${manualIdRef.current++}`;
+        const group = await runOcrRegion(
+          crop,
+          SCALE / OCR_SCALE,
+          { left: sel.left, top: sel.top },
+          id,
+          sourceLang,
+          pageIndex
+        );
+        if (group) {
+          onManualRegion(group);
+        } else {
+          setRegionError({
+            pageIndex,
+            message: "この範囲から翻訳できる文字を検出できませんでした",
+          });
+        }
+      } catch (e) {
+        setRegionError({
+          pageIndex,
+          message: e instanceof Error ? e.message : String(e),
+        });
+      } finally {
+        setRegionOcr(null);
       }
-
-      // 表示座標 → 高解像度canvasのピクセル座標（×OCR_SCALE/SCALE）。canvas範囲内にクランプする。
-      const ratio = OCR_SCALE / SCALE;
-      const sx = Math.max(0, Math.floor(sel.left * ratio));
-      const sy = Math.max(0, Math.floor(sel.top * ratio));
-      const sw = Math.min(full.width - sx, Math.ceil(sel.width * ratio));
-      const sh = Math.min(full.height - sy, Math.ceil(sel.height * ratio));
-      if (sw <= 0 || sh <= 0) return;
-
-      const crop = document.createElement("canvas");
-      crop.width = sw;
-      crop.height = sh;
-      const cctx = crop.getContext("2d");
-      if (!cctx) throw new Error("canvasコンテキストの取得に失敗しました");
-      cctx.drawImage(full, sx, sy, sw, sh, 0, 0, sw, sh);
-
-      const id = `manual-${manualIdRef.current++}`;
-      const group = await runOcrRegion(
-        crop,
-        SCALE / OCR_SCALE,
-        { left: sel.left, top: sel.top },
-        id,
-        sourceLang
-      );
-      if (group) {
-        onManualRegion(group);
-      } else {
-        setRegionError("この範囲から翻訳できる文字を検出できませんでした");
-      }
-    } catch (e) {
-      setRegionError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRegionOcrRunning(false);
-    }
-  }
-
-  // 手動グループと大きく重なる自動グループ、およびユーザーが削除した自動グループは非表示にする。
-  // 削除は描画抑制のみ（自動グループのstateや翻訳結果自体は保持したまま。dismissedIds側で制御）。
-  const overlaps = (a: Box, b: Box) => centerInside(a, b) || centerInside(b, a);
-  const visibleAuto = groups.filter(
-    (g) => !dismissedIds.has(g.id) && !manualGroups.some((m) => overlaps(g.box, m.box))
+    },
+    [sourceLang, onManualRegion]
   );
-  const rendered = [...visibleAuto, ...manualGroups].filter((g) => g.translatable);
+
+  if (error) {
+    return (
+      <div className="flex h-64 w-full max-w-3xl items-center justify-center rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-600 dark:border-red-900 dark:bg-red-950/30">
+        PDFの表示に失敗しました: {error}
+      </div>
+    );
+  }
+
+  if (numPages === 0) {
+    return (
+      <div className="flex h-64 w-full max-w-3xl items-center justify-center text-sm text-zinc-500 dark:text-zinc-400">
+        PDFを解析しています…
+      </div>
+    );
+  }
 
   return (
-    // 外側: ズーム後の実サイズぶんレイアウト領域を確保する（スクロールを正しく機能させるため）
-    <div
-      style={{
-        width: viewportSize.width ? viewportSize.width * zoom : undefined,
-        height: viewportSize.height ? viewportSize.height * zoom : undefined,
-      }}
-    >
-      {/* 内側: 座標計算はズーム前のまま。CSS transformで見た目だけ拡大縮小する */}
-      <div
-        className="relative bg-white shadow"
-        style={{
-          width: viewportSize.width || undefined,
-          height: viewportSize.height || undefined,
-          transform: `scale(${zoom})`,
-          transformOrigin: "top left",
-        }}
-      >
-        <canvas ref={canvasRef} className="block" />
-        {ocrRunning && (
-          <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800">
-            {ocrPhase === "probe"
-              ? "このPDFにはテキスト層がないため、原文の言語を判定しながらOCRしています（数十秒かかる場合があります）…"
-              : "指定した言語でOCRを実行しています（数十秒かかる場合があります）…"}
-          </p>
-        )}
-        {regionOcrRunning && (
-          <p className="absolute inset-x-0 top-0 z-20 bg-blue-100 p-2 text-center text-xs text-blue-800">
-            選択領域をOCRしています…
-          </p>
-        )}
-        {regionError && (
-          <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800">
-            {regionError}
-          </p>
-        )}
-        {error && (
-          <p className="absolute inset-0 flex items-center justify-center bg-white/90 p-4 text-sm text-red-600">
-            PDFの表示に失敗しました: {error}
-          </p>
-        )}
-        <div
-          className="absolute inset-0"
-          style={{ visibility: showTranslation ? "visible" : "hidden" }}
-        >
-          {rendered.map((g) => (
-            <OverlayItem
-              key={g.id}
-              group={g}
-              translation={translations[g.id]}
-              onRetranslate={onRetranslate}
-              onDismiss={onDismiss}
-            />
-          ))}
-        </div>
-        {selectionMode && (
-          // 最前面でマウスドラッグを受け取り、翻訳ボックスより上に選択矩形を描く。
-          <div
-            ref={selectionLayerRef}
-            onMouseDown={handleSelectionDown}
-            onMouseMove={handleSelectionMove}
-            onMouseUp={handleSelectionUp}
-            onMouseLeave={handleSelectionUp}
-            className="absolute inset-0 z-10"
-            style={{ cursor: "crosshair" }}
-          >
-            {drag &&
-              (() => {
-                const r = normalizeRect(drag);
-                return (
-                  <div
-                    style={{
-                      position: "absolute",
-                      left: r.left,
-                      top: r.top,
-                      width: r.width,
-                      height: r.height,
-                      border: "1.5px dashed #2563eb",
-                      background: "rgba(37,99,235,0.12)",
-                      pointerEvents: "none",
-                    }}
-                  />
-                );
-              })()}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function OverlayItem({
-  group,
-  translation,
-  onRetranslate,
-  onDismiss,
-}: {
-  group: LineGroup;
-  translation: TranslationEntry | undefined;
-  onRetranslate: (group: LineGroup) => void;
-  onDismiss: (id: string) => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [scaleX, setScaleX] = useState(1);
-  const [hovered, setHovered] = useState(false);
-  const text = translation?.text ?? group.text;
-  const loading = translation === undefined;
-  const failed = translation?.failed ?? false;
-  // 「文脈を踏まえて全体を再翻訳」（パス2）で見直された訳文かどうか。
-  // 枠・背景は既存の状態表示のまま、文字色だけ赤にして見分けられるようにする。
-  const refined = translation?.refined ?? false;
-  // refined時、更新前(previousText)と現在(text)を文字単位で比較し、実際に
-  // 変わった区間だけ抽出する。previousTextが無い/完全一致なら差分なし(通常表示)。
-  // diffCharsは1翻訳ボックスぶん（数十文字程度）が対象で軽量なため、都度計算する。
-  const diffSegments =
-    refined && translation?.previousText && translation.previousText !== text
-      ? diffChars(translation.previousText, text)
-      : null;
-
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    setScaleX(1);
-    const raw = el.scrollWidth;
-    if (raw > group.box.width && raw > 0) {
-      setScaleX(Math.max(group.box.width / raw, 0.4));
-    }
-  }, [text, group.box.width]);
-
-  const { box } = group;
-  const fontSize = Math.max(box.height * 0.85, 8);
-  // 翻訳ボックスだと一目でわかるよう、状態ごとに塗り＋枠線で強調する。
-  // 黄色=翻訳待ち、水色=ローカルLLMによる翻訳成功、オレンジ=応答が得られず原文のまま
-  const { background, border } = loading
-    ? { background: "#fef9c3", border: "1.5px dashed #ca8a04" }
-    : failed
-      ? { background: "#fed7aa", border: "1.5px dashed #ea580c" }
-      : { background: "#dbeafe", border: "1.5px solid #2563eb" };
-
-  return (
-    <div
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      title={
-        failed
-          ? "ローカルLLMからの応答が得られなかったため原文を表示しています（ホバーで再翻訳・削除）"
-          : loading
-            ? "翻訳待ちです"
-            : refined
-              ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示・ホバーで再翻訳・削除）"
-              : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
-      }
-      style={{
-        position: "absolute",
-        left: box.left,
-        top: box.top,
-        width: box.width,
-        // 文字がボックス高より大きくなる場合に縦方向で欠けないよう、
-        // 最小高さだけ指定して実際の高さはコンテンツに合わせて伸ばす。
-        minHeight: box.height,
-        height: "auto",
-        display: "flex",
-        alignItems: "center",
-        padding: "1px 2px",
-        background,
-        border,
-        boxSizing: "border-box",
-        boxShadow: "0 1px 3px rgba(0,0,0,0.25)",
-        overflow: "visible",
-        transform: box.angle ? `rotate(${box.angle}rad)` : undefined,
-        transformOrigin: "left top",
-      }}
-    >
-      <div
-        ref={ref}
-        style={{
-          display: "inline-block",
-          whiteSpace: "nowrap",
-          fontSize,
-          lineHeight: 1.3,
-          color: "#111111",
-          transform: scaleX < 1 ? `scaleX(${scaleX})` : undefined,
-          transformOrigin: "left top",
-        }}
-      >
-        {diffSegments
-          ? // 文脈適応翻訳（パス2）で実際に変わった区間だけ赤字にする。
-            // 変わっていない区間はそのまま黒字（旧訳と同じ）。
-            diffSegments.map((seg, i) => (
-              <span
-                key={i}
-                style={
-                  seg.changed
-                    ? { color: "#dc2626", fontWeight: 600 }
-                    : undefined
-                }
-              >
-                {seg.text}
-              </span>
-            ))
-          : text}
-      </div>
-      {!loading && hovered && (
-        // 翻訳が済んだボックス（青=成功/オレンジ=失敗）にホバーすると、再翻訳・削除の小さなボタンを重ねて表示する。
-        // 文字化けなど、システム上は成功でも実質失敗しているケースも直せるよう、失敗フラグに限定しない。
-        <div
-          className="absolute -top-2.5 -right-2.5 z-30 flex gap-1"
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <button
-            type="button"
-            title="再翻訳する"
-            onClick={(e) => {
-              e.stopPropagation();
-              onRetranslate(group);
-            }}
-            className="flex h-5 w-5 items-center justify-center rounded-full border border-blue-500 bg-white text-[11px] leading-none text-blue-700 shadow hover:bg-blue-50"
-          >
-            ⟲
-          </button>
-          <button
-            type="button"
-            title="この翻訳結果を削除する（削除後、OCRエリア指定で範囲を囲み直すと再翻訳できます）"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDismiss(group.id);
-            }}
-            className="flex h-5 w-5 items-center justify-center rounded-full border border-red-500 bg-white text-[11px] leading-none text-red-700 shadow hover:bg-red-50"
-          >
-            ×
-          </button>
-        </div>
-      )}
+    <div className="flex flex-col items-center gap-10 pt-6">
+      {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => (
+        <PdfPageView
+          key={n}
+          page={pagesState[n - 1] as unknown as RenderablePage}
+          pageIndex={n}
+          pageCount={numPages}
+          scale={SCALE}
+          viewportSize={pageViewportSizes[n - 1] ?? { width: 0, height: 0 }}
+          zoom={zoom}
+          groups={pageGroups[n] ?? []}
+          manualGroups={manualGroups}
+          translations={translations}
+          showTranslation={showTranslation}
+          dismissedIds={dismissedIds}
+          onRetranslate={onRetranslate}
+          onDismiss={onDismiss}
+          selectionMode={selectionMode}
+          onManualSelection={handleManualSelection}
+          status={pageStatus[n] ?? "pending"}
+          ocrPhase={activeOcr?.pageIndex === n ? activeOcr.phase : undefined}
+          regionOcrRunning={regionOcr?.pageIndex === n}
+          regionError={regionError?.pageIndex === n ? regionError.message : null}
+        />
+      ))}
     </div>
   );
 }

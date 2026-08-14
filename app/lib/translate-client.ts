@@ -12,6 +12,13 @@ type TranslateOptions = {
   expert?: ExpertKey;
   /** 原文の言語。未確定（自動判定できていない）ならnull/undefined。 */
   sourceLang?: SourceLang | null;
+  /**
+   * 呼び出し元（親コンポーネント）が保持するメモ化キャッシュ。複数ページPDFでは
+   * ページをまたいで同じ文字列（"Total"等の反復ラベル）が頻出するため、ページごとに
+   * translateGroupsを呼んでもキャッシュが引き継がれるよう外から注入できるようにする。
+   * 未指定時は従来どおり呼び出しごとのローカルキャッシュになる。
+   */
+  cache?: Map<string, TranslationEntry>;
 };
 
 // サーバー側は1行ずつ独立して翻訳・リトライするため、クライアントは
@@ -55,7 +62,7 @@ export async function translateGroups(
   const targets = groups.filter((g) => g.translatable);
   if (targets.length === 0) return;
 
-  const cache = new Map<string, TranslationEntry>();
+  const cache = options?.cache ?? new Map<string, TranslationEntry>();
   const chunks = chunkGroups(targets);
 
   for (const chunk of chunks) {

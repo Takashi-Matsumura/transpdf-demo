@@ -146,11 +146,13 @@ export type OcrResult = {
  * pdfjsのテキスト層と同じ「行内の水平ギャップでセル分割する」ロジックに通す。
  *
  * sourceLang が null（未確定）の場合は PROBE_LANGS で判定兼用のOCRを行う。
+ * pageIndex は複数ページPDFでのid名前空間分離・LineGroup.pageIndex付与に使う。
  */
 export async function runOcr(
   canvas: HTMLCanvasElement,
   toDisplayScale: number,
-  sourceLang: SourceLang | null
+  sourceLang: SourceLang | null,
+  pageIndex: number
 ): Promise<OcrResult> {
   return enqueue(async () => {
     const langs = sourceLang ? OCR_LANGS[sourceLang] : PROBE_LANGS;
@@ -158,10 +160,13 @@ export async function runOcr(
     const { data } = await worker.recognize(canvas, {}, { blocks: true });
 
     const raw = wordsToRawItems(data, toDisplayScale);
-    const groups = buildLineGroups(raw, { joiner: " " });
+    const groups = buildLineGroups(raw, {
+      joiner: " ",
+      idPrefix: `p${pageIndex}-ocr-`,
+      pageIndex,
+    });
     const filtered = groups.map((g) => ({
       ...g,
-      id: `ocr-${g.id}`,
       translatable: g.translatable && !looksLikeOcrGarbage(g.text),
     }));
 
@@ -189,13 +194,15 @@ export async function runOcr(
  * bbox は切り出しcanvasの原点基準なので、toDisplayScale で表示座標に戻したうえで
  * 選択領域左上の offset（表示座標）を加算してページ絶対座標に合わせる。
  * 文字が拾えない／翻訳対象でない場合は null を返す（呼び出し側で無視する）。
+ * pageIndex はこの領域が属するページ番号（LineGroup.pageIndexに付与する）。
  */
 export async function runOcrRegion(
   canvas: HTMLCanvasElement,
   toDisplayScale: number,
   offset: { left: number; top: number },
   id: string,
-  sourceLang: SourceLang | null
+  sourceLang: SourceLang | null,
+  pageIndex: number
 ): Promise<LineGroup | null> {
   return enqueue(async () => {
     const langs = sourceLang ? OCR_LANGS[sourceLang] : PROBE_LANGS;
@@ -239,6 +246,7 @@ export async function runOcrRegion(
         angle: 0,
       },
       translatable: true,
+      pageIndex,
     };
   });
 }

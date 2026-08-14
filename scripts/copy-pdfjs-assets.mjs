@@ -75,7 +75,9 @@ if (existsSync(tesseractDir) && existsSync(tesseractCoreDir)) {
 // oem=1（LSTM_ONLY）で使うため、各パッケージの 4.0.0_best_int/ 側を使う
 // （langPath を明示すると tesseract.js 側の best_int 自動選択が効かなくなるため、
 //  こちらで正しいバリアントを選んでおく必要がある）。
-const LANGS = ["vie", "eng", "mya"];
+// jpn は app/lib/ocr.ts の OCR_LANGS（vie/eng向けの対訳PDF二重翻訳防止）で
+// 実際に使われるため、翻訳対象言語ではないがここに含める必要がある。
+const LANGS = ["vie", "eng", "mya", "jpn"];
 const langPublicDir = path.join(publicDir, "tesseract-lang");
 mkdirSync(langPublicDir, { recursive: true });
 const copiedLangs = [];

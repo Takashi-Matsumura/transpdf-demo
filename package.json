@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@tesseract.js-data/eng": "^1.0.0",
+    "@tesseract.js-data/jpn": "^1.0.0",
     "@tesseract.js-data/mya": "^1.0.0",
     "@tesseract.js-data/vie": "^1.0.0",
     "next": "16.2.10",
