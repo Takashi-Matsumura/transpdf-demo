@@ -35,6 +35,12 @@ export default function PdfTranslatorApp() {
   const [translations, setTranslations] = useState<Record<string, TranslationEntry>>({});
   const [showTranslation, setShowTranslation] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // 「PDFとして保存」の準備状態。trueの間、Viewerに全ページの強制描画を指示する。
+  const [forceRenderAll, setForceRenderAll] = useState(false);
+  const [printPreparing, setPrintPreparing] = useState(false);
+  // 全ページ描画完了のコールバックが複数回・古い印刷準備分も含めて発火しても
+  // window.print()を1回しか呼ばないようにするガード。
+  const printFiredRef = useRef(false);
   const [zoom, setZoom] = useState(1);
   const [selectionMode, setSelectionMode] = useState(false);
   const [manualGroups, setManualGroups] = useState<LineGroup[]>([]);
@@ -146,6 +152,61 @@ export default function PdfTranslatorApp() {
     setZoom((z) => Math.max(0.5, Math.round((z - 0.25) * 100) / 100));
   }, []);
   const zoomReset = useCallback(() => setZoom(1), []);
+
+  // 全ページの強制描画が完了したときに呼ばれる。「印刷準備中…」タイムアウトからも
+  // 呼ばれうるため、window.print()は最初の1回だけ実行する。
+  const handleAllPagesRendered = useCallback(() => {
+    if (printFiredRef.current) return;
+    printFiredRef.current = true;
+    // canvasへの描画完了直後だとブラウザがまだペイントし切っていない可能性があるため、
+    // 描画フレームを2つ挟んでから印刷ダイアログを開く。
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        window.print();
+      });
+    });
+  }, []);
+
+  // 「PDFとして保存」ボタン。手動選択・原文表示中でも、翻訳結果だけを印刷対象にする
+  // ため、印刷準備の間だけこれらを強制的に切り替える（afterprintで元に戻す）。
+  const handlePrintClick = useCallback(() => {
+    printFiredRef.current = false;
+    setSelectionMode(false);
+    setShowTranslation(true);
+    setPrintPreparing(true);
+    setForceRenderAll(true);
+  }, []);
+
+  // 印刷ダイアログを閉じたら（保存してもキャンセルしても）遅延読み込みの挙動へ戻す。
+  useEffect(() => {
+    function handleAfterPrint() {
+      setForceRenderAll(false);
+      setPrintPreparing(false);
+    }
+    window.addEventListener("afterprint", handleAfterPrint);
+    return () => window.removeEventListener("afterprint", handleAfterPrint);
+  }, []);
+
+  // 一部ページの描画が既知の無応答不具合（RENDER_TIMEOUT_MS相当）等で完了しない場合に
+  // 備え、一定時間で諦めてその時点の内容のまま印刷する（Viewer側にも窓ごとの
+  // タイムアウトがあるが、これは最終防衛線）。ページ数が多いほど窓の数が増え
+  // 待ち時間も伸びるため、ページ数に応じて猶予を延ばす。
+  useEffect(() => {
+    if (!printPreparing) return;
+    const total = pageProgress.total || 1;
+    const timeout = setTimeout(
+      () => {
+        if (!printFiredRef.current) {
+          console.warn(
+            "一部ページの描画待ちでタイムアウトしました。現時点の内容で印刷します。"
+          );
+          handleAllPagesRendered();
+        }
+      },
+      30_000 + total * 4_000
+    );
+    return () => clearTimeout(timeout);
+  }, [printPreparing, pageProgress.total, handleAllPagesRendered]);
 
   const loadPdfFile = useCallback(
     async (file: File) => {
@@ -400,6 +461,21 @@ export default function PdfTranslatorApp() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [data]);
 
+  // Cmd/Ctrl+P（ブラウザ標準の印刷）を横取りし、「PDFとして保存」ボタンと同じ
+  // 準備フロー（画面外ページの強制描画）を通す。横取りしないと、画面外の
+  // 未描画ページがそのまま白紙で出力されてしまう。
+  useEffect(() => {
+    if (!data) return;
+    function handleKeyDown(e: KeyboardEvent) {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      if (e.key !== "p" && e.key !== "P") return;
+      e.preventDefault();
+      handlePrintClick();
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [data, handlePrintClick]);
+
   const handleDismiss = useCallback(
     (id: string) => {
       // 翻訳結果を消し、ボックス自体も非表示にする。
@@ -476,7 +552,7 @@ export default function PdfTranslatorApp() {
 
   return (
     <div className="flex flex-1 flex-col items-center gap-6 bg-zinc-50 px-6 py-10 dark:bg-black">
-      <div className="flex w-full max-w-3xl flex-col gap-4">
+      <div className="flex w-full max-w-3xl flex-col gap-4 print:hidden">
         <h1 className="text-2xl font-semibold text-black dark:text-zinc-50">
           外国語PDF 日本語オーバーレイ翻訳
         </h1>
@@ -588,6 +664,17 @@ export default function PdfTranslatorApp() {
                 </button>
               </>
             )}
+
+            <button
+              type="button"
+              onClick={handlePrintClick}
+              disabled={printPreparing}
+              className={`rounded-full border border-black/[.15] px-4 py-1.5 text-sm font-medium hover:bg-black/[.04] disabled:opacity-40 dark:border-white/[.15] dark:hover:bg-[#1a1a1a] ${
+                allPagesProcessed ? "ml-auto" : ""
+              }`}
+            >
+              {printPreparing ? "印刷準備中…" : "PDFとして保存"}
+            </button>
 
             {!allPagesProcessed && (
               <button
@@ -725,7 +812,7 @@ export default function PdfTranslatorApp() {
         )}
       </div>
 
-      <div className="flex w-full justify-center overflow-auto">
+      <div className="flex w-full justify-center overflow-auto print:overflow-visible">
         {data ? (
           <PdfOverlayViewer
             data={data}
@@ -745,6 +832,8 @@ export default function PdfTranslatorApp() {
             processingEnabled={processingEnabled}
             onPageProgress={handlePageProgress}
             refiningIds={refiningIds}
+            forceRenderAll={forceRenderAll}
+            onAllPagesRendered={handleAllPagesRendered}
           />
         ) : (
           <div

@@ -25,6 +25,50 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
+/* 「PDFとして保存」用。
+   html/bodyのh-full/min-h-full flex flex-colは通常表示のレイアウト都合で必要だが、
+   縦flexのままだと印刷時の改ページ（フラグメンテーション）の妨げになりうるため、
+   印刷時は通常のブロックフローに戻す。OSがダークモードだと `prefers-color-scheme: dark`
+   は印刷時も一致してしまいアプリの黒背景（dark:bg-black等）がそのまま印刷されうるため、
+   ページ全体の背景・文字色は白地・黒文字に固定する。 */
+@media print {
+  /* 用紙の余白。未指定だとブラウザ既定に依存し、印刷用の縮小倍率（印字可能領域の
+     見積り）が読めなくなるため明示する。 */
+  @page {
+    margin: 10mm;
+  }
+  html {
+    height: auto;
+  }
+  body {
+    display: block;
+    min-height: 0;
+    background: #fff;
+    color: #000;
+  }
+
+  /* 「文脈を踏まえて再翻訳中」のパルスグローが中途半端な位相で紙面に写り込むのを防ぐ。 */
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* Chromeは印刷時に背景色・背景画像を既定で省略する。翻訳ボックスの塗り
+   （状態を示す 青=翻訳成功 / 黄=翻訳待ち / 橙=翻訳失敗）はPdfPageViewの
+   OverlayItemでインラインstyleとして指定しているためCSSで代替できず、
+   省略されると状態が判別できなくなる。ページ本体（.print-exact-colors）の
+   範囲だけ「配色をそのまま印刷」に指定する。文書全体（*）に当てると、
+   ダークモード時にアプリのヘッダー等の黒背景まで印刷されてしまうため、
+   スコープを絞ることが重要。 */
+@media print {
+  .print-exact-colors,
+  .print-exact-colors * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}
+
 /* 「文脈を踏まえて全体を再翻訳」で、今まさに処理対象になっている翻訳ボックスを
    Claudeの思考中インジケータのように呼吸するグローで強調する。 */
 @keyframes refine-glow {

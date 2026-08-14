@@ -67,6 +67,19 @@ type Props = {
    * 該当するボックスをパルスするグローで強調表示する。
    */
   refiningIds: Set<string>;
+  /**
+   * trueの間は visible（画面内かどうか）に関わらず強制的に描画する。
+   * 「PDFとして保存」の直前に、画面外で未描画（canvasが解放された状態）の
+   * ページも含めて全ページを描画させるために使う。
+   */
+  forceRender?: boolean;
+  /**
+   * 描画が確定するたびに呼ばれる。ok=falseは中断または失敗（絵は無い）。
+   * 印刷準備の「このページは処理済み」判定に使う。forceRenderが立った時点で
+   * 既にこのページが描画済み（画面内で先に表示されていた等）だった場合も、
+   * 改めてこのコールバックで通知する。
+   */
+  onRendered?: (pageIndex: number, ok: boolean) => void;
 };
 
 const MIN_SELECTION_PX = 8; // 誤クリックを手動選択として扱わないための最小サイズ（表示座標px）
@@ -138,6 +151,8 @@ export default function PdfPageView({
   regionOcrRunning,
   regionError,
   refiningIds,
+  forceRender,
+  onRendered,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -163,12 +178,37 @@ export default function PdfPageView({
     return () => observer.disconnect();
   }, []);
 
-  // visibleの間だけcanvasへ実描画する。画面外に出たら描画タスクを中断し、
-  // canvasのピクセルバッファを解放する（幅/高さを0にする既知の解放手段）。
+  // visible（画面内）またはforceRender（PDF保存直前の強制描画）のどちらかが立っていれば
+  // 実描画する。この値そのもの（真偽値）を依存に使うのが重要 — [visible, forceRender] を
+  // 別々に依存へ入れると、既に画面内で描画済みのページでもforceRenderがtrueになった
+  // 瞬間にeffectが再実行され、無駄な再描画（cancel→再render）が走ってしまう
+  // （このコードベースは同一ドキュメントへの同時render()でpdfjsが無応答になる不具合を
+  // 実機で特定しており、印刷時に多数のページが一斉に無駄な再描画を始めるのは避けたい）。
+  const active = visible || !!forceRender;
+
+  // 今canvasに入っている絵がどの描画パラメータのものか（null=未描画）。
+  // forceRenderが立った時点で「このページは既に描画済みか」を判定するために使う
+  // （下のeffect）。
+  const renderKey = `${scale}|${rotation ?? "auto"}`;
+  const renderedKeyRef = useRef<string | null>(null);
+
+  // 描画effectの依存にコールバックを直接入れると、親が再レンダーのたびに新しい
+  // 関数を渡す場合にeffectが余計に再実行されうる。refで受け渡して切り離す。
+  const onRenderedRef = useRef(onRendered);
   useEffect(() => {
-    if (!visible) return;
+    onRenderedRef.current = onRendered;
+  }, [onRendered]);
+
+  // visible/forceRenderの間だけcanvasへ実描画する。activeでなくなったら描画タスクを
+  // 中断し、canvasのピクセルバッファを解放する（幅/高さを0にする既知の解放手段）。
+  useEffect(() => {
+    if (!active) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // React StrictMode（開発時）はeffectを一度破棄→再実行するため、破棄された側の
+    // async関数はawaitの続きが実行され続ける。破棄済みインスタンスがonRenderedを
+    // 呼んで印刷準備の判定を汚さないよう、ローカルフラグで見張る。
+    let disposed = false;
 
     async function render() {
       const viewport = page.getViewport({ scale, rotation });
@@ -180,8 +220,14 @@ export default function PdfPageView({
       renderTaskRef.current = task;
       try {
         await task.promise;
+        if (disposed) return;
+        renderedKeyRef.current = renderKey;
+        onRenderedRef.current?.(pageIndex, true);
       } catch {
-        // 画面外へ出た際のcancel()による中断（RenderingCancelledException）。無視してよい。
+        // 画面外へ出た際のcancel()による中断（RenderingCancelledException）と、
+        // 実際の描画失敗の両方がここに来る。どちらも「この絵は使えない」で扱いは同じ。
+        renderedKeyRef.current = null;
+        if (!disposed) onRenderedRef.current?.(pageIndex, false);
       } finally {
         if (renderTaskRef.current === task) renderTaskRef.current = null;
       }
@@ -190,12 +236,24 @@ export default function PdfPageView({
     void render();
 
     return () => {
+      disposed = true;
       renderTaskRef.current?.cancel();
       renderTaskRef.current = null;
+      renderedKeyRef.current = null;
       canvas.width = 0;
       canvas.height = 0;
     };
-  }, [visible, page, scale, rotation]);
+  }, [active, page, scale, rotation, renderKey, pageIndex]);
+
+  // forceRenderが立った時点で、上のeffectが（activeが既にtrueだったため）再実行
+  // されず、このページが「既に描画済み」の場合がある。印刷準備側が「このページは
+  // 準備済み」と判断できるよう、ここで改めて通知する。
+  useEffect(() => {
+    if (!forceRender) return;
+    if (renderedKeyRef.current === renderKey) {
+      onRenderedRef.current?.(pageIndex, true);
+    }
+  }, [forceRender, renderKey, pageIndex]);
 
   // 「一時メッセージは数秒で自動的に消す」は親（Viewer）側でregionErrorのライフサイクルを
   // 管理する想定だが、ここでは受け取った文字列をそのまま表示するだけに留める。
@@ -251,7 +309,7 @@ export default function PdfPageView({
         height: viewportSize.height ? viewportSize.height * zoom : undefined,
       }}
     >
-      <div className="absolute -top-6 left-0 flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
+      <div className="absolute -top-6 left-0 flex items-center gap-2 text-xs text-zinc-500 print:hidden dark:text-zinc-400">
         <span>
           {pageIndex} / {pageCount}
         </span>
@@ -268,7 +326,7 @@ export default function PdfPageView({
         )}
       </div>
       <div
-        className="relative bg-white shadow"
+        className="relative bg-white shadow print-exact-colors print:shadow-none"
         style={{
           width: viewportSize.width || undefined,
           height: viewportSize.height || undefined,
@@ -277,25 +335,25 @@ export default function PdfPageView({
         }}
       >
         <canvas ref={canvasRef} className="block" />
-        {!visible && (
-          <div className="absolute inset-0 flex items-center justify-center bg-zinc-100 text-xs text-zinc-400 dark:bg-zinc-900">
+        {!visible && !forceRender && (
+          <div className="absolute inset-0 flex items-center justify-center bg-zinc-100 text-xs text-zinc-400 print:hidden dark:bg-zinc-900">
             スクロールして表示
           </div>
         )}
         {status === "processing" && ocrPhase && (
-          <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800">
+          <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800 print:hidden">
             {ocrPhase === "probe"
               ? "このPDFにはテキスト層がないため、原文の言語を判定しながらOCRしています（数十秒かかる場合があります）…"
               : "指定した言語でOCRを実行しています（数十秒かかる場合があります）…"}
           </p>
         )}
         {regionOcrRunning && (
-          <p className="absolute inset-x-0 top-0 z-20 bg-blue-100 p-2 text-center text-xs text-blue-800">
+          <p className="absolute inset-x-0 top-0 z-20 bg-blue-100 p-2 text-center text-xs text-blue-800 print:hidden">
             選択領域をOCRしています…
           </p>
         )}
         {regionError && (
-          <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800">
+          <p className="absolute inset-x-0 top-0 z-20 bg-amber-100 p-2 text-center text-xs text-amber-800 print:hidden">
             {regionError}
           </p>
         )}
@@ -321,7 +379,7 @@ export default function PdfPageView({
             onMouseMove={handleSelectionMove}
             onMouseUp={handleSelectionUp}
             onMouseLeave={handleSelectionUp}
-            className="absolute inset-0 z-10"
+            className="absolute inset-0 z-10 print:hidden"
             style={{ cursor: "crosshair" }}
           >
             {drag &&
@@ -472,7 +530,7 @@ function OverlayItem({
       </div>
       {!loading && hovered && (
         <div
-          className="absolute -top-2.5 -right-2.5 z-30 flex gap-1"
+          className="absolute -top-2.5 -right-2.5 z-30 flex gap-1 print:hidden"
           onMouseDown={(e) => e.stopPropagation()}
         >
           <button
