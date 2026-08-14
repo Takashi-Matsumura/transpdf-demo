@@ -24,3 +24,19 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* 「文脈を踏まえて全体を再翻訳」で、今まさに処理対象になっている翻訳ボックスを
+   Claudeの思考中インジケータのように呼吸するグローで強調する。 */
+@keyframes refine-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 2px rgba(168, 85, 247, 0.3),
+      0 0 6px 1px rgba(168, 85, 247, 0.3);
+  }
+  50% {
+    box-shadow:
+      0 0 0 3px rgba(168, 85, 247, 0.75),
+      0 0 18px 5px rgba(168, 85, 247, 0.6);
+  }
+}

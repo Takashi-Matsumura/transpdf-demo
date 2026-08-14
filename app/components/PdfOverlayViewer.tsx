@@ -48,6 +48,11 @@ type Props = {
   processingEnabled: boolean;
   /** ページ単位の処理進捗。done: 処理済みページ数、total: 全ページ数。 */
   onPageProgress?: (done: number, total: number) => void;
+  /**
+   * 「文脈を踏まえて全体を再翻訳」で、今まさにLLMへ送られているグループのid集合。
+   * 該当するボックスをパルスするグローで強調表示する。
+   */
+  refiningIds: Set<string>;
 };
 
 const SCALE = 1.5;
@@ -126,6 +131,7 @@ export default function PdfOverlayViewer({
   onDismiss,
   processingEnabled,
   onPageProgress,
+  refiningIds,
 }: Props) {
   const pdfjsRef = useRef<typeof PdfjsNS | null>(null);
   // 効果（effect）・コールバック内部からの参照用。refなのでレンダー中には読まない
@@ -557,6 +563,7 @@ export default function PdfOverlayViewer({
           ocrPhase={activeOcr?.pageIndex === n ? activeOcr.phase : undefined}
           regionOcrRunning={regionOcr?.pageIndex === n}
           regionError={regionError?.pageIndex === n ? regionError.message : null}
+          refiningIds={refiningIds}
         />
       ))}
     </div>

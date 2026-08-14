@@ -54,6 +54,11 @@ type Props = {
   regionOcrRunning: boolean;
   /** このページの手動領域OCRで直近に発生したエラーメッセージ。 */
   regionError: string | null;
+  /**
+   * 「文脈を踏まえて全体を再翻訳」で、今まさにLLMへ送られているグループのid集合。
+   * 該当するボックスをパルスするグローで強調表示する。
+   */
+  refiningIds: Set<string>;
 };
 
 const MIN_SELECTION_PX = 8; // 誤クリックを手動選択として扱わないための最小サイズ（表示座標px）
@@ -122,6 +127,7 @@ export default function PdfPageView({
   ocrPhase,
   regionOcrRunning,
   regionError,
+  refiningIds,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -286,6 +292,7 @@ export default function PdfPageView({
               translation={translations[g.id]}
               onRetranslate={onRetranslate}
               onDismiss={onDismiss}
+              refining={refiningIds.has(g.id)}
             />
           ))}
         </div>
@@ -329,11 +336,14 @@ function OverlayItem({
   translation,
   onRetranslate,
   onDismiss,
+  refining,
 }: {
   group: LineGroup;
   translation: TranslationEntry | undefined;
   onRetranslate: (group: LineGroup) => void;
   onDismiss: (id: string) => void;
+  /** 「文脈を踏まえて全体を再翻訳」で、今まさにLLMへ送られている最中かどうか。 */
+  refining: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [scaleX, setScaleX] = useState(1);
@@ -370,19 +380,26 @@ function OverlayItem({
     : failed
       ? { background: "#fed7aa", border: "1.5px dashed #ea580c" }
       : { background: "#dbeafe", border: "1.5px solid #2563eb" };
+  // 「文脈を踏まえて全体を再翻訳」で今まさに送信中のグループは、状態表示より優先して
+  // 紫の呼吸するグローで強調する（Claudeの思考中インジケータを参考にした表現）。
+  const refiningStyle: React.CSSProperties | undefined = refining
+    ? { border: "2px solid #a855f7", animation: "refine-glow 1.3s ease-in-out infinite" }
+    : undefined;
 
   return (
     <div
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       title={
-        failed
-          ? "ローカルLLMからの応答が得られなかったため原文を表示しています（ホバーで再翻訳・削除）"
-          : loading
-            ? "翻訳待ちです"
-            : refined
-              ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示・ホバーで再翻訳・削除）"
-              : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
+        refining
+          ? "文脈を踏まえて再翻訳中です…"
+          : failed
+            ? "ローカルLLMからの応答が得られなかったため原文を表示しています（ホバーで再翻訳・削除）"
+            : loading
+              ? "翻訳待ちです"
+              : refined
+                ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示・ホバーで再翻訳・削除）"
+                : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
       }
       style={{
         position: "absolute",
@@ -400,6 +417,7 @@ function OverlayItem({
         border,
         boxSizing: "border-box",
         boxShadow: "0 1px 3px rgba(0,0,0,0.25)",
+        ...refiningStyle,
         overflow: "visible",
         transform: box.angle ? `rotate(${box.angle}rad)` : undefined,
         transformOrigin: "left top",
