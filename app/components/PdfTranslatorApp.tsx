@@ -56,6 +56,9 @@ export default function PdfTranslatorApp() {
     "idle" | "analyzing" | "refining" | "done" | "error"
   >("idle");
   const [refineError, setRefineError] = useState<string | null>(null);
+  // パス2で今まさにLLMへ送信中のグループid（最大チャンクサイズぶん）。
+  // オーバーレイ側で「処理対象」を光らせて示すために使う。
+  const [refiningIds, setRefiningIds] = useState<Set<string>>(new Set());
   // ユーザーが明示的に選んだ原文言語。nullなら自動判定に従う。
   const [langOverride, setLangOverride] = useState<SourceLang | null>(null);
   // 抽出/OCR結果から自動判定した言語。判定できるまでnull。
@@ -127,6 +130,7 @@ export default function PdfTranslatorApp() {
     setDocumentAnalysis(null);
     setRefineStatus("idle");
     setRefineError(null);
+    setRefiningIds(new Set());
     setSelectionMode(false);
     setErrorMessage(null);
     setZoom(1);
@@ -309,6 +313,7 @@ export default function PdfTranslatorApp() {
 
     setRefineStatus("analyzing");
     setRefineError(null);
+    setRefiningIds(new Set());
 
     // 文脈推定には原文と現時点の訳文のペアを渡す。誤訳が混じっていても、
     // 原文も一緒に見せることで文書全体の分野を推定しやすくする狙い。
@@ -345,14 +350,26 @@ export default function PdfTranslatorApp() {
             });
           },
           controller.signal,
-          { context: analysis.summary, expert: analysis.expert, sourceLang, cache: pass2CacheRef.current }
+          {
+            context: analysis.summary,
+            expert: analysis.expert,
+            sourceLang,
+            cache: pass2CacheRef.current,
+            // 各チャンクの送信直前にidを通知してもらい、そのチャンクぶんのボックスを
+            // 「処理対象」として強調表示する。次のチャンクが始まれば自動的に入れ替わる。
+            onChunkStart: (ids) => setRefiningIds(new Set(ids)),
+          }
         ).then(() => {
-          if (!controller.signal.aborted) setRefineStatus("done");
+          if (!controller.signal.aborted) {
+            setRefineStatus("done");
+            setRefiningIds(new Set());
+          }
         });
       })
       .catch((e) => {
         if (!controller.signal.aborted) {
           setRefineStatus("error");
+          setRefiningIds(new Set());
           setRefineError(e instanceof Error ? e.message : String(e));
         }
       });
@@ -453,6 +470,7 @@ export default function PdfTranslatorApp() {
     setDocumentAnalysis(null);
     setRefineStatus("idle");
     setRefineError(null);
+    setRefiningIds(new Set());
     setErrorMessage(null);
   }, []);
 
@@ -695,6 +713,13 @@ export default function PdfTranslatorApp() {
               <span className="font-semibold text-red-600">あ</span>
               文脈を踏まえて再翻訳された訳文
             </span>
+            <span className="flex items-center gap-1.5">
+              <span
+                className="inline-block h-3 w-3 rounded-sm border-2 border-[#a855f7]"
+                style={{ boxShadow: "0 0 6px 2px rgba(168,85,247,0.6)" }}
+              />
+              今まさに再翻訳中の項目
+            </span>
             <span>翻訳済みのボックスにマウスを乗せると再翻訳・削除ができます</span>
           </div>
         )}
@@ -719,6 +744,7 @@ export default function PdfTranslatorApp() {
             onDismiss={handleDismiss}
             processingEnabled={processingEnabled}
             onPageProgress={handlePageProgress}
+            refiningIds={refiningIds}
           />
         ) : (
           <div

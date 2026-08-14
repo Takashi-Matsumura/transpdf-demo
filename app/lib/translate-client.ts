@@ -19,6 +19,12 @@ type TranslateOptions = {
    * 未指定時は従来どおり呼び出しごとのローカルキャッシュになる。
    */
   cache?: Map<string, TranslationEntry>;
+  /**
+   * 各チャンクの翻訳リクエストを送る直前に、対象グループのid一覧を通知する。
+   * 「今まさに処理対象になっている」ことをUI側で強調表示する（パス2の再翻訳中インジケータ用）ために使う。
+   * チャンク単位（最大MAX_ITEMS_PER_CHUNK件）での通知になる点に注意。
+   */
+  onChunkStart?: (ids: string[]) => void;
 };
 
 // サーバー側は1行ずつ独立して翻訳・リトライするため、クライアントは
@@ -67,6 +73,7 @@ export async function translateGroups(
 
   for (const chunk of chunks) {
     if (signal?.aborted) return;
+    options?.onChunkStart?.(chunk.map((g) => g.id));
 
     const uncached = chunk.filter((g) => !cache.has(g.text));
     if (uncached.length > 0) {
