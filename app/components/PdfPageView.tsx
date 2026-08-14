@@ -18,7 +18,7 @@ export type PdfRenderTask = {
 
 // pdfjsのPDFPageProxyのうち、このコンポーネントで使う部分だけを構造的に表した型。
 export type RenderablePage = {
-  getViewport(params: { scale: number }): { width: number; height: number };
+  getViewport(params: { scale: number; rotation?: number }): { width: number; height: number };
   render(params: {
     canvas: HTMLCanvasElement;
     canvasContext: CanvasRenderingContext2D;
@@ -32,6 +32,14 @@ type Props = {
   pageCount: number;
   /** page.getViewport({ scale }) の scale。SCALE定数はViewer側で一元管理し、ここへ渡す。 */
   scale: number;
+  /**
+   * page.getViewport に渡す絶対回転角（度）。スキャン画像自体が回転しているページを
+   * 正立させるためにViewer側が検出した補正込みの絶対値。undefinedならpdfjs既定
+   * （page.rotate、PDFの/Rotateメタデータ）で描画する。
+   */
+  rotation?: number;
+  /** rotationがPDF自体の/Rotateではなく、内容の向き検出による補正を含む場合true。バッジ表示用。 */
+  rotationCorrected?: boolean;
   /** scale適用後（ズーム前）のページサイズ。プレースホルダのレイアウトに使う。 */
   viewportSize: { width: number; height: number };
   zoom: number;
@@ -112,6 +120,8 @@ export default function PdfPageView({
   pageIndex,
   pageCount,
   scale,
+  rotation,
+  rotationCorrected,
   viewportSize,
   zoom,
   groups,
@@ -161,7 +171,7 @@ export default function PdfPageView({
     if (!canvas) return;
 
     async function render() {
-      const viewport = page.getViewport({ scale });
+      const viewport = page.getViewport({ scale, rotation });
       canvas!.width = Math.floor(viewport.width);
       canvas!.height = Math.floor(viewport.height);
       const ctx = canvas!.getContext("2d");
@@ -185,7 +195,7 @@ export default function PdfPageView({
       canvas.width = 0;
       canvas.height = 0;
     };
-  }, [visible, page, scale]);
+  }, [visible, page, scale, rotation]);
 
   // 「一時メッセージは数秒で自動的に消す」は親（Viewer）側でregionErrorのライフサイクルを
   // 管理する想定だが、ここでは受け取った文字列をそのまま表示するだけに留める。
@@ -248,6 +258,14 @@ export default function PdfPageView({
         <span className={`rounded-full px-2 py-0.5 font-medium ${badge.className}`}>
           {badge.label}
         </span>
+        {rotationCorrected && (
+          <span
+            className="rounded-full bg-sky-200 px-2 py-0.5 font-medium text-sky-800 dark:bg-sky-900 dark:text-sky-300"
+            title="スキャン画像の向きを検出し、正立するよう回転補正しています"
+          >
+            向きを補正
+          </span>
+        )}
       </div>
       <div
         className="relative bg-white shadow"

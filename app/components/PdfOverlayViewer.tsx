@@ -5,8 +5,8 @@ import type * as PdfjsNS from "pdfjs-dist";
 import type { PDFPageProxy } from "pdfjs-dist";
 import PdfPageView, { type PdfPageStatus, type RenderablePage } from "./PdfPageView";
 import { detectSourceLang, groupTextItems, loadPdfjs } from "@/app/lib/pdf";
-import { runOcr, runOcrRegion } from "@/app/lib/ocr";
-import type { Box, LineGroup, SourceLang, TranslationEntry } from "@/app/lib/types";
+import { detectPageRotation, runOcr, runOcrRegion } from "@/app/lib/ocr";
+import type { Box, LineGroup, PageRotation, SourceLang, TranslationEntry } from "@/app/lib/types";
 
 type Props = {
   /** 表示するPDFの生データ */
@@ -58,6 +58,9 @@ type Props = {
 const SCALE = 1.5;
 // OCRは低解像度だと精度が大きく落ちるため、表示用よりも高い解像度で別途レンダリングする。
 const OCR_SCALE = 3;
+// 回転検出は「どの向きが最もよく読めるか」の相対比較なので、本OCR(OCR_SCALE=3)ほどの
+// 解像度は不要。ただし低すぎると小さな文字がどの向きでも読めず判定不能になるため1.5とする。
+const DETECT_SCALE = 1.5;
 // sourceLang未確定時に判定兼用OCRを試みる最大ページ数。これを超えたら中立(null)のまま本処理へ進む。
 const PROBE_MAX_PAGES = 3;
 
@@ -80,9 +83,13 @@ const RENDER_TIMEOUT_MS = 45_000;
 async function renderPageToCanvas(
   page: PDFPageProxy,
   scale: number,
+  // page.getViewportへ渡す絶対回転角（度）。undefinedならpdfjs既定（=page.rotate、
+  // PDFの/Rotateメタデータ）。ページ内容自体が回転しているスキャンを正立させたい場合は
+  // 呼び出し側が (page.rotate + 検出した補正量) % 360 を渡す。
+  rotation: number | undefined,
   onCancelRegistered?: (cancel: () => void) => () => void
 ): Promise<HTMLCanvasElement> {
-  const viewport = page.getViewport({ scale });
+  const viewport = page.getViewport({ scale, rotation });
   const canvas = document.createElement("canvas");
   canvas.width = Math.floor(viewport.width);
   canvas.height = Math.floor(viewport.height);
@@ -164,6 +171,13 @@ export default function PdfOverlayViewer({
   // ページごとのテキスト層抽出結果キャッシュ。言語に依存しないため一度判定したら使い回す。
   // undefined=未判定、null=テキスト層なし（OCR対象と確定）、配列=テキスト層あり。
   const textLayerGroupsRef = useRef<Record<number, LineGroup[] | null | undefined>>({});
+  // ページ番号(1始まり) -> 検出した回転補正量（度）。未検出のページはキーが存在しない。
+  // sourceLang変更時の再処理（effect 2a）では消さない — 回転はスキャン画像自体の向きの
+  // 問題であり原文言語には依存しないため、一度確定したら使い回してよい。
+  // refを真実の源とし、stateは描画（PdfPageViewへの伝搬）専用に持つ
+  // （pagesRef/pagesStateと同じパターン。effect 2bの依存に入れないための分離）。
+  const pageRotationsRef = useRef<Record<number, PageRotation>>({});
+  const [pageRotations, setPageRotations] = useState<Record<number, PageRotation>>({});
   // 処理（テキスト抽出/OCR）が完了したページ番号の集合。中断→再開でやり直さないために使う。
   const processedRef = useRef<Set<number>>(new Set());
   // sourceLang未確定のままPROBE_MAX_PAGES試して判定できなかった場合、以後は再判定を
@@ -302,6 +316,40 @@ export default function PdfOverlayViewer({
       return () => pendingRenderCancels.delete(cancel);
     }
 
+    // このページのOCR用回転補正量を確定する（未検出なら低解像度OCRで検出しキャッシュする）。
+    // テキスト層があるページはOCRしないため呼び出し元で除外している。誤った向きのページでは
+    // 言語判定も崩れるため、probePage/processPageの本OCRより必ず先に呼ぶこと。
+    async function ensurePageRotation(n: number, page: PDFPageProxy): Promise<PageRotation> {
+      const cached = pageRotationsRef.current[n];
+      if (cached !== undefined) return cached;
+
+      // rotation未指定 = pdfjs既定（page.rotate、PDFの/Rotateメタデータ）で描画。
+      const canvas = await renderPageToCanvas(page, DETECT_SCALE, undefined, registerRenderCancel);
+      let rotation: PageRotation;
+      try {
+        rotation = await detectPageRotation(canvas, sourceLang);
+      } finally {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+
+      pageRotationsRef.current[n] = rotation;
+      setPageRotations((prev) => ({ ...prev, [n]: rotation }));
+
+      if (rotation !== 0) {
+        // 90/270°では幅と高さが入れ替わる。手動swapはミスを生みやすいので、
+        // pdfjsのviewportから正しい向きの寸法を取り直す。
+        const vp = page.getViewport({ scale: SCALE, rotation: (page.rotate + rotation) % 360 });
+        setPageViewportSizes((prev) => {
+          const next = [...prev];
+          next[n - 1] = { width: vp.width, height: vp.height };
+          return next;
+        });
+      }
+
+      return rotation;
+    }
+
     // 判定兼用OCR（sourceLang未確定時のprobeフェーズ専用）。結果は公開せず、
     // 検出できた言語だけを返す（捨てる予定のこの結果は翻訳へ回さない＝LLM呼び出しの二重化を防ぐ）。
     async function probePage(n: number): Promise<SourceLang | null> {
@@ -324,7 +372,13 @@ export default function PdfOverlayViewer({
 
       setActiveOcr({ pageIndex: n, phase: "probe" });
       try {
-        const canvas = await renderPageToCanvas(page, OCR_SCALE, registerRenderCancel);
+        const rotation = await ensurePageRotation(n, page);
+        const canvas = await renderPageToCanvas(
+          page,
+          OCR_SCALE,
+          (page.rotate + rotation) % 360,
+          registerRenderCancel
+        );
         const result = await runOcr(canvas, SCALE / OCR_SCALE, null, n);
         canvas.width = 0;
         canvas.height = 0;
@@ -367,7 +421,13 @@ export default function PdfOverlayViewer({
       // テキスト層が存在しない（スキャン/画像ベースの）ページ。OCRする。
       setActiveOcr({ pageIndex: n, phase: sourceLang === null ? "probe" : "final" });
       try {
-        const canvas = await renderPageToCanvas(page, OCR_SCALE, registerRenderCancel);
+        const rotation = await ensurePageRotation(n, page);
+        const canvas = await renderPageToCanvas(
+          page,
+          OCR_SCALE,
+          (page.rotate + rotation) % 360,
+          registerRenderCancel
+        );
         const result = await runOcr(canvas, SCALE / OCR_SCALE, sourceLang, n);
         canvas.width = 0;
         canvas.height = 0;
@@ -475,7 +535,10 @@ export default function PdfOverlayViewer({
             cache.canvas.width = 0;
             cache.canvas.height = 0;
           }
-          full = await renderPageToCanvas(page, OCR_SCALE);
+          // ユーザーはpageViewportSizes基準の正立表示上で範囲を選んでいるため、
+          // 自動OCRと同じ検出済み回転（未検出＝テキスト層ページ等なら0）で描画する。
+          const rotation = pageRotationsRef.current[pageIndex] ?? 0;
+          full = await renderPageToCanvas(page, OCR_SCALE, (page.rotate + rotation) % 360);
           ocrCanvasCacheRef.current = { pageIndex, canvas: full };
         }
 
@@ -541,31 +604,42 @@ export default function PdfOverlayViewer({
 
   return (
     <div className="flex flex-col items-center gap-10 pt-6">
-      {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => (
-        <PdfPageView
-          key={n}
-          page={pagesState[n - 1] as unknown as RenderablePage}
-          pageIndex={n}
-          pageCount={numPages}
-          scale={SCALE}
-          viewportSize={pageViewportSizes[n - 1] ?? { width: 0, height: 0 }}
-          zoom={zoom}
-          groups={pageGroups[n] ?? []}
-          manualGroups={manualGroups}
-          translations={translations}
-          showTranslation={showTranslation}
-          dismissedIds={dismissedIds}
-          onRetranslate={onRetranslate}
-          onDismiss={onDismiss}
-          selectionMode={selectionMode}
-          onManualSelection={handleManualSelection}
-          status={pageStatus[n] ?? "pending"}
-          ocrPhase={activeOcr?.pageIndex === n ? activeOcr.phase : undefined}
-          regionOcrRunning={regionOcr?.pageIndex === n}
-          regionError={regionError?.pageIndex === n ? regionError.message : null}
-          refiningIds={refiningIds}
-        />
-      ))}
+      {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => {
+        // ensurePageRotationが検出した補正量（PDFの/Rotateとは別物）を絶対角に変換して渡す。
+        // 未検出または0°ならundefined（PdfPageView側もpdfjs既定=page.rotateで描画する）。
+        const rotationDelta = pageRotations[n];
+        const rotation =
+          rotationDelta !== undefined && rotationDelta !== 0
+            ? ((pagesState[n - 1]?.rotate ?? 0) + rotationDelta) % 360
+            : undefined;
+        return (
+          <PdfPageView
+            key={n}
+            page={pagesState[n - 1] as unknown as RenderablePage}
+            pageIndex={n}
+            pageCount={numPages}
+            scale={SCALE}
+            rotation={rotation}
+            rotationCorrected={!!rotationDelta}
+            viewportSize={pageViewportSizes[n - 1] ?? { width: 0, height: 0 }}
+            zoom={zoom}
+            groups={pageGroups[n] ?? []}
+            manualGroups={manualGroups}
+            translations={translations}
+            showTranslation={showTranslation}
+            dismissedIds={dismissedIds}
+            onRetranslate={onRetranslate}
+            onDismiss={onDismiss}
+            selectionMode={selectionMode}
+            onManualSelection={handleManualSelection}
+            status={pageStatus[n] ?? "pending"}
+            ocrPhase={activeOcr?.pageIndex === n ? activeOcr.phase : undefined}
+            regionOcrRunning={regionOcr?.pageIndex === n}
+            regionError={regionError?.pageIndex === n ? regionError.message : null}
+            refiningIds={refiningIds}
+          />
+        );
+      })}
     </div>
   );
 }

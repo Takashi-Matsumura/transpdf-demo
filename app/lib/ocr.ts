@@ -3,7 +3,7 @@
 import type { Page, Worker } from "tesseract.js";
 import { buildLineGroups, detectSourceLang, isTranslatable } from "./pdf";
 import type { RawItem } from "./pdf";
-import type { LineGroup, SourceLang } from "./types";
+import type { LineGroup, PageRotation, SourceLang } from "./types";
 
 /**
  * 原文言語が確定したときに実際にOCRへ渡すtesseract言語セット。
@@ -124,6 +124,102 @@ function wordsToRawItems(data: Page, toDisplayScale: number): RawItem[] {
     }
   }
   return raw;
+}
+
+/** orientationScore が「この語は読めている」と数えるための最低信頼度(0-100)。 */
+const MIN_WORD_CONFIDENCE = 60;
+/** この値以上のスコアが出た時点で、以降の角度を試さず正立(0°)と確定する（短絡判定）。 */
+const SHORTCIRCUIT_SCORE = 40;
+/** 4角度すべてのスコアがこれ未満なら「そもそも文字が無いページ（白紙・図版）」とみなし、
+ *  誤って回転させないよう0°を返す。 */
+const MIN_ROTATION_SCORE = 5;
+
+/**
+ * OCR結果が「その向きでどれだけよく読めたか」を表すスコア。
+ * data.confidence（全体平均信頼度）は誤った向きでも一部の記号・数字が
+ * 偶然高信頼で読めて高止まりすることがあるため単独では使えない。
+ * 代わりに「高信頼度で読め、かつゴミ判定を通った語」の文字数を信頼度で
+ * 重み付けして合計する。読めた語が多いほど、また確信度が高いほどスコアが伸びる。
+ */
+function orientationScore(data: Page): number {
+  let score = 0;
+  for (const block of data.blocks ?? []) {
+    for (const paragraph of block.paragraphs) {
+      for (const line of paragraph.lines) {
+        for (const word of line.words) {
+          const text = word.text.trim();
+          if (!text || looksLikeOcrGarbage(text)) continue;
+          if (word.confidence < MIN_WORD_CONFIDENCE) continue;
+          score += (word.confidence / 100) * text.length;
+        }
+      }
+    }
+  }
+  return score;
+}
+
+// 90度倍数の回転はピクセルの並べ替えだけで済む（補間による劣化が無い）ため、
+// PDFを再renderせず2Dキャンバス操作で作る方が安い。
+function rotateCanvas(source: HTMLCanvasElement, degrees: 90 | 180 | 270): HTMLCanvasElement {
+  const swapDims = degrees === 90 || degrees === 270;
+  const canvas = document.createElement("canvas");
+  canvas.width = swapDims ? source.height : source.width;
+  canvas.height = swapDims ? source.width : source.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("canvasコンテキストの取得に失敗しました");
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((degrees * Math.PI) / 180);
+  ctx.drawImage(source, -source.width / 2, -source.height / 2);
+  return canvas;
+}
+
+/**
+ * スキャン画像の中身自体が回転しているページを検出する。
+ * PDFの/Rotateメタデータとは無関係に、0/90/180/270°で低解像度OCRを試し、
+ * 最もよく読める向きを採用する（Tesseract Legacyコア・osd.traineddataが要る
+ * OSD機能は使わず、既存のLSTMコア・言語データだけで完結させる）。
+ *
+ * 0°を先に試し、十分なスコアが出れば残り3角度をスキップする（大半のページは
+ * 正立なので、追加コストは1回のOCRのみで済む）。全角度が閾値未満（白紙・図版等、
+ * そもそも文字が無いページ）の場合は誤って回転させないよう0°を返す。
+ *
+ * canvas は呼び出し側が用意した低解像度（検出専用）のもの。この関数は内部で
+ * 生成した回転済み一時canvasを解放するが、引数のcanvas自体の解放は呼び出し側の責務。
+ */
+export async function detectPageRotation(
+  canvas: HTMLCanvasElement,
+  sourceLang: SourceLang | null
+): Promise<PageRotation> {
+  return enqueue(async () => {
+    const langs = sourceLang ? OCR_LANGS[sourceLang] : PROBE_LANGS;
+    const worker = await getWorker(langs);
+
+    let best: PageRotation = 0;
+    let bestScore = -Infinity;
+
+    const { data: baseline } = await worker.recognize(canvas, {}, { blocks: true });
+    bestScore = orientationScore(baseline);
+
+    if (bestScore < SHORTCIRCUIT_SCORE) {
+      // 発生頻度順（縦向きスキャンは90°回転の方が180°より一般的）に残りを試す。
+      for (const degrees of [90, 270, 180] as const) {
+        const rotated = rotateCanvas(canvas, degrees);
+        try {
+          const { data } = await worker.recognize(rotated, {}, { blocks: true });
+          const score = orientationScore(data);
+          if (score > bestScore) {
+            bestScore = score;
+            best = degrees;
+          }
+        } finally {
+          rotated.width = 0;
+          rotated.height = 0;
+        }
+      }
+    }
+
+    return bestScore >= MIN_ROTATION_SCORE ? best : 0;
+  });
 }
 
 export type OcrResult = {
