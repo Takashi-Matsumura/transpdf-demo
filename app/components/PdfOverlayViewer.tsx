@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type * as PdfjsNS from "pdfjs-dist";
 import type { PDFPageProxy } from "pdfjs-dist";
 import PdfPageView, { type PdfPageStatus, type RenderablePage } from "./PdfPageView";
@@ -598,6 +598,29 @@ export default function PdfOverlayViewer({
     [sourceLang, onManualRegion]
   );
 
+  // 文書内で最も多いページ幅（＝この文書における「普通の」ページ幅）。
+  // 90/270°回転補正で幅高が入れ替わったページだけでなく、PDF自体がもともと横長
+  // （日本語文書の間に挟まる横長の別紙等）で他ページより幅広いページも、この基準幅に
+  // 揃えて縮小表示する（下のfitScale算出で使用）。全ページが同じ幅ならこの値イコール
+  // その幅になり、影響しない。
+  const referenceWidth = useMemo(() => {
+    if (baseViewportSizes.length === 0) return 0;
+    const counts = new Map<number, number>();
+    for (const { width } of baseViewportSizes) {
+      const rounded = Math.round(width);
+      counts.set(rounded, (counts.get(rounded) ?? 0) + 1);
+    }
+    let best = baseViewportSizes[0].width;
+    let bestCount = 0;
+    for (const [width, count] of counts) {
+      if (count > bestCount) {
+        bestCount = count;
+        best = width;
+      }
+    }
+    return best;
+  }, [baseViewportSizes]);
+
   if (error) {
     return (
       <div className="flex h-64 w-full max-w-3xl items-center justify-center rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-600 dark:border-red-900 dark:bg-red-950/30">
@@ -615,7 +638,7 @@ export default function PdfOverlayViewer({
   }
 
   return (
-    <div className="flex flex-col items-center gap-10 pt-6">
+    <div className="flex w-full flex-col gap-10">
       {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => {
         // ensurePageRotationが検出した補正量（PDFの/Rotateとは別物）を絶対角に変換して渡す。
         // 未検出または0°ならundefined（PdfPageView側もpdfjs既定=page.rotateで描画する）。
@@ -624,39 +647,55 @@ export default function PdfOverlayViewer({
           rotationDelta !== undefined && rotationDelta !== 0
             ? ((pagesState[n - 1]?.rotate ?? 0) + rotationDelta) % 360
             : undefined;
-        // 90/270°補正で幅と高さが入れ替わり、他ページより横幅が広くなって画面から
-        // はみ出すことがある。90/270°補正が入っていなければこの本来の幅と現在の幅は
-        // 一致するため、fitScaleは常に1になり無害（180°補正や未回転ページには影響しない）。
+        // 90/270°補正で幅と高さが入れ替わったページ・PDF自体がもともと横長なページは、
+        // 他ページ（referenceWidth）より横幅が広くなって画面からはみ出すことがある。
+        // referenceWidth以下のページはfitScaleが常に1になり無害。
         const currentSize = pageViewportSizes[n - 1] ?? { width: 0, height: 0 };
-        const baseWidth = baseViewportSizes[n - 1]?.width ?? currentSize.width;
         const fitScale =
-          currentSize.width > 0 ? Math.min(1, baseWidth / currentSize.width) : 1;
+          currentSize.width > referenceWidth && referenceWidth > 0
+            ? referenceWidth / currentSize.width
+            : 1;
         return (
-          <PdfPageView
-            key={n}
-            page={pagesState[n - 1] as unknown as RenderablePage}
-            pageIndex={n}
-            pageCount={numPages}
-            scale={SCALE}
-            rotation={rotation}
-            rotationCorrected={!!rotationDelta}
-            viewportSize={currentSize}
-            zoom={zoom * fitScale}
-            groups={pageGroups[n] ?? []}
-            manualGroups={manualGroups}
-            translations={translations}
-            showTranslation={showTranslation}
-            dismissedIds={dismissedIds}
-            onRetranslate={onRetranslate}
-            onDismiss={onDismiss}
-            selectionMode={selectionMode}
-            onManualSelection={handleManualSelection}
-            status={pageStatus[n] ?? "pending"}
-            ocrPhase={activeOcr?.pageIndex === n ? activeOcr.phase : undefined}
-            regionOcrRunning={regionOcr?.pageIndex === n}
-            regionError={regionError?.pageIndex === n ? regionError.message : null}
-            refiningIds={refiningIds}
-          />
+          // ページ単位で横スクロールできる領域にする。1つの巨大なスクロール領域を
+          // 全ページで共有すると、横にはみ出すページの横スクロールバーが文書の
+          // 一番下（最終ページの下）にしか現れず、そのページを見ている間は
+          // 実質使えなくなる。ページごとに区切ることで、はみ出したページの
+          // 直下に常にそのページ用の横スクロールバーが表示される。
+          //
+          // overflow-x を visible 以外にすると、CSSの仕様により overflow-y も
+          // 自動的に visible ではなくなる（片方だけvisibleは許されないため）。
+          // PdfPageView内のページ番号バッジは `-top-6`（-24px）で自身の上に
+          // はみ出す形で配置されているため、そのままだと上端がクリップされて
+          // 見えなくなる。pt-6（24px）で内側を24px分下げ、バッジの実効位置を
+          // クリップ領域の内側（y=0以上）に収める。
+          <div key={n} className="w-full overflow-x-auto pt-6">
+            <div className="flex" style={{ justifyContent: "safe center" }}>
+              <PdfPageView
+                page={pagesState[n - 1] as unknown as RenderablePage}
+                pageIndex={n}
+                pageCount={numPages}
+                scale={SCALE}
+                rotation={rotation}
+                rotationCorrected={!!rotationDelta}
+                viewportSize={currentSize}
+                zoom={zoom * fitScale}
+                groups={pageGroups[n] ?? []}
+                manualGroups={manualGroups}
+                translations={translations}
+                showTranslation={showTranslation}
+                dismissedIds={dismissedIds}
+                onRetranslate={onRetranslate}
+                onDismiss={onDismiss}
+                selectionMode={selectionMode}
+                onManualSelection={handleManualSelection}
+                status={pageStatus[n] ?? "pending"}
+                ocrPhase={activeOcr?.pageIndex === n ? activeOcr.phase : undefined}
+                regionOcrRunning={regionOcr?.pageIndex === n}
+                regionError={regionError?.pageIndex === n ? regionError.message : null}
+                refiningIds={refiningIds}
+              />
+            </div>
+          </div>
         );
       })}
     </div>
