@@ -135,7 +135,15 @@ export function groupTextItems(
   viewport: PageViewport,
   pageIndex: number
 ): LineGroup[] {
-  return buildLineGroups(toRawItems(pdfjs, items, viewport), { pageIndex });
+  // idPrefixを省略するとページ間で"g0"等のidが衝突する（groupIndexが各呼び出しで0から
+  // 始まるため）。翻訳結果・削除状態はグループidをキーにページ横断で保持している
+  // （PdfTranslatorApp.tsx の translations/dismissedIds）ため、テキスト層を持つ複数ページの
+  // PDFでは別ページの訳文・削除状態が誤って表示される事故になる。OCR経路（ocr.ts）は
+  // 既に `p${pageIndex}-ocr-` を付けているので、テキスト層経路にも同様のページ名前空間を付ける。
+  return buildLineGroups(toRawItems(pdfjs, items, viewport), {
+    idPrefix: `p${pageIndex}-text-`,
+    pageIndex,
+  });
 }
 
 /**
