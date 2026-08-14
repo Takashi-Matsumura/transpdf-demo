@@ -156,6 +156,14 @@ export default function PdfOverlayViewer({
   const [pageViewportSizes, setPageViewportSizes] = useState<
     { width: number; height: number }[]
   >([]);
+  // 回転補正前（page.rotateのみ反映した）の各ページの寸法。ensurePageRotationが
+  // pageViewportSizesを回転後の寸法（90/270°では幅高が入れ替わる）で上書きするため、
+  // 「回転していなければ本来この幅だった」という基準値を別途保持しておく。
+  // 横長になったページを、この基準幅に収まるよう自動的に縮小表示するために使う
+  // （render中に参照するためref ではなく state で持つ）。
+  const [baseViewportSizes, setBaseViewportSizes] = useState<
+    { width: number; height: number }[]
+  >([]);
   const [error, setError] = useState<string | null>(null);
   // effect 1（ドキュメント読込）完了のたびにインクリメントし、effect 2b（処理ループ）を起動するトリガー。
   const [docToken, setDocToken] = useState(0);
@@ -202,6 +210,7 @@ export default function PdfOverlayViewer({
       setError(null);
       setNumPages(0);
       setPageViewportSizes([]);
+      setBaseViewportSizes([]);
       setPageGroups({});
       setPageStatus({});
       setActiveOcr(null);
@@ -210,6 +219,8 @@ export default function PdfOverlayViewer({
       setPagesState([]);
       ocrPagesRef.current = [];
       textLayerGroupsRef.current = {};
+      pageRotationsRef.current = {};
+      setPageRotations({});
       processedRef.current = new Set();
       probeExhaustedRef.current = false;
       if (ocrCanvasCacheRef.current) {
@@ -252,6 +263,7 @@ export default function PdfOverlayViewer({
         }
         if (cancelled) return;
 
+        setBaseViewportSizes(sizes);
         pagesRef.current = pages;
         setPagesState(pages);
         ocrPagesRef.current = ocrPages;
@@ -612,6 +624,13 @@ export default function PdfOverlayViewer({
           rotationDelta !== undefined && rotationDelta !== 0
             ? ((pagesState[n - 1]?.rotate ?? 0) + rotationDelta) % 360
             : undefined;
+        // 90/270°補正で幅と高さが入れ替わり、他ページより横幅が広くなって画面から
+        // はみ出すことがある。90/270°補正が入っていなければこの本来の幅と現在の幅は
+        // 一致するため、fitScaleは常に1になり無害（180°補正や未回転ページには影響しない）。
+        const currentSize = pageViewportSizes[n - 1] ?? { width: 0, height: 0 };
+        const baseWidth = baseViewportSizes[n - 1]?.width ?? currentSize.width;
+        const fitScale =
+          currentSize.width > 0 ? Math.min(1, baseWidth / currentSize.width) : 1;
         return (
           <PdfPageView
             key={n}
@@ -621,8 +640,8 @@ export default function PdfOverlayViewer({
             scale={SCALE}
             rotation={rotation}
             rotationCorrected={!!rotationDelta}
-            viewportSize={pageViewportSizes[n - 1] ?? { width: 0, height: 0 }}
-            zoom={zoom}
+            viewportSize={currentSize}
+            zoom={zoom * fitScale}
             groups={pageGroups[n] ?? []}
             manualGroups={manualGroups}
             translations={translations}
