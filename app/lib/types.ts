@@ -27,6 +27,13 @@ export type LineGroup = {
  */
 export type SourceLang = "vie" | "eng" | "mya";
 
+/**
+ * スキャン画像の中身自体が回転しているページを正立させるための補正量（度、時計回り）。
+ * PDFの/Rotateメタデータ（pdfjsが暗黙に適用する）とは別物で、こちらはOCRの
+ * 認識結果から推定する。0=補正不要。
+ */
+export type PageRotation = 0 | 90 | 180 | 270;
+
 /** オーバーレイに表示する1グループぶんの翻訳結果。 */
 export type TranslationEntry = {
   text: string;
