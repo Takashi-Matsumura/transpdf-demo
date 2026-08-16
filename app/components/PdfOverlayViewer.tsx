@@ -79,11 +79,14 @@ const PRINT_RENDER_WINDOW = 4;
 // 印刷準備が窓の中で一定時間まったく進まない場合、その窓内の未報告ページを
 // 「失敗」として扱い次へ進める（1ページの不具合が印刷準備全体を止めないように）。
 const PRINT_PAGE_STALL_MS = 15_000;
-// 印刷時、1ページを収めたい目標サイズ（CSS px）。A4縦は96dpi換算で794×1123px、
+// 印刷時、1ページを収めたい目標サイズ（CSS px, 96dpi換算）。A4は794×1123px、
 // globals.cssの `@page { margin: 10mm }` で四辺約38pxを引いた印字可能領域は
-// およそ718×1047px。少し余裕を持たせた値にする（Letterは794より少し幅広・
-// 低めなのでこの値なら両方収まる）。
-const PRINT_PAGE_BOX = { width: 700, height: 1020 };
+// およそ718×1047px。できるだけ用紙いっぱいに使うため、丸め誤差ぶんだけ
+// 少し余裕を持たせた値にする（Letterは794より少し幅広・低めなのでこの値なら
+// 両方収まる）。内容が横長のページはglobals.cssの`.print-landscape`で用紙自体を
+// 横向きに切り替える（page: print-landscape）ため、縦横を入れ替えた値を使う。
+const PRINT_PAGE_BOX_PORTRAIT = { width: 716, height: 1045 };
+const PRINT_PAGE_BOX_LANDSCAPE = { width: 1045, height: 716 };
 
 // pdfjsのpage.render()は、ページの内容（CCITT/JBIG2等の圧縮フォーマットや解像度の組み合わせ）
 // によっては、canvasやページ番号に関係なくPromiseが解決も拒否もされず無期限に応答しなくなる
@@ -735,17 +738,17 @@ export default function PdfOverlayViewer({
           currentSize.width > referenceWidth && referenceWidth > 0
             ? referenceWidth / currentSize.width
             : 1;
-        // 印刷時は画面のズーム倍率ではなく、用紙1枚に収まる倍率へ強制的に切り替える。
-        // 印刷時のレイアウト幅は用紙の印字可能幅（A4縦で約718px）までしかないため、
-        // SCALE=1.5で約900px幅のページを画面のズーム倍率のまま出すと横が切れる。
-        // 幅・高さ両方で収まる方を採る（横長ページは幅基準、縦長ページは高さ基準）。
+        // 印刷時は画面のズーム倍率ではなく、用紙1枚にできるだけ大きく収まる倍率へ
+        // 強制的に切り替える。印刷時のレイアウト幅は用紙の印字可能幅までしかない
+        // ため、SCALE=1.5で約900px幅のページを画面のズーム倍率のまま出すと横が
+        // 切れる。内容が横長のページはglobals.cssの`.print-landscape`で用紙自体を
+        // 横向きに切り替えるので、目標サイズも縦横を入れ替えたものを使う
+        // （そうしないと横長ページが縦向きの狭い用紙基準で不必要に縮小されてしまう）。
+        const isLandscapePage = currentSize.width > currentSize.height;
+        const printBox = isLandscapePage ? PRINT_PAGE_BOX_LANDSCAPE : PRINT_PAGE_BOX_PORTRAIT;
         const printZoom =
           currentSize.width > 0 && currentSize.height > 0
-            ? Math.min(
-                1,
-                PRINT_PAGE_BOX.width / currentSize.width,
-                PRINT_PAGE_BOX.height / currentSize.height
-              )
+            ? Math.min(1, printBox.width / currentSize.width, printBox.height / currentSize.height)
             : 1;
         const effectiveZoom = forceRenderAll ? printZoom : zoom * fitScale;
         return (
@@ -771,7 +774,7 @@ export default function PdfOverlayViewer({
             key={n}
             className={`w-full overflow-x-auto pt-6 print:overflow-visible print:pt-0 print:break-inside-avoid ${
               n < numPages ? "print:break-after-page" : ""
-            }`}
+            } ${isLandscapePage ? "print-landscape" : ""}`}
           >
             <div className="flex justify-center-safe">
               <PdfPageView

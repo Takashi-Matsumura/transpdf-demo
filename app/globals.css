@@ -32,9 +32,21 @@ body {
    は印刷時も一致してしまいアプリの黒背景（dark:bg-black等）がそのまま印刷されうるため、
    ページ全体の背景・文字色は白地・黒文字に固定する。 */
 @media print {
-  /* 用紙の余白。未指定だとブラウザ既定に依存し、印刷用の縮小倍率（印字可能領域の
-     見積り）が読めなくなるため明示する。 */
+  /* 用紙サイズ・余白・向き。未指定だとブラウザ/OSの既定（ロケール等）に依存して
+     しまい、印刷用の縮小倍率（印字可能領域の見積り）も読めなくなるため明示する。
+     日本国内での利用を想定しA4を既定にする（印刷ダイアログの用紙選択で上書きは可能）。 */
   @page {
+    size: A4 portrait;
+    margin: 10mm;
+  }
+  /* 名前付きページ（CSS Paged Media）。回転補正で正立させた表やもともと横長の
+     別紙など、内容が横長のページだけ横向き用紙に切り替える。`.print-landscape`
+     要素に`page: print-landscape`（下記）を指定すると、その要素が生成するページ
+     フラグメントがこの用紙設定で印刷される（Chromium系ブラウザのみ対応。
+     Firefox/Safariは@pageのsizeを実装していないため既定の縦向きにフォールバック
+     するだけで実害はない）。 */
+  @page print-landscape {
+    size: A4 landscape;
     margin: 10mm;
   }
   html {
@@ -52,6 +64,11 @@ body {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* 内容が横長のページ（PdfOverlayViewer.tsxが判定）に付与する。印刷時以外は無害。 */
+.print-landscape {
+  page: print-landscape;
 }
 
 /* Chromeは印刷時に背景色・背景画像を既定で省略する。翻訳ボックスの塗り
