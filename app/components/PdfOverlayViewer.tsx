@@ -53,6 +53,13 @@ type Props = {
    * 該当するボックスをパルスするグローで強調表示する。
    */
   refiningIds: Set<string>;
+  /**
+   * trueの間、全ページを強制描画する（「PDFとして保存」の直前準備）。
+   * 画面外で未描画（canvasが解放された状態）のページも含めて全ページに描画させる。
+   */
+  forceRenderAll?: boolean;
+  /** forceRenderAll中に全ページの描画が完了したら一度だけ呼ばれる。 */
+  onAllPagesRendered?: () => void;
 };
 
 const SCALE = 1.5;
@@ -63,6 +70,23 @@ const OCR_SCALE = 3;
 const DETECT_SCALE = 1.5;
 // sourceLang未確定時に判定兼用OCRを試みる最大ページ数。これを超えたら中立(null)のまま本処理へ進む。
 const PROBE_MAX_PAGES = 3;
+
+// 「PDFとして保存」の準備で、同時に強制描画するページ数の上限。全ページ同時に
+// page.render()を投げると、同一ドキュメントへの同時render()でpdfjsが無応答になる
+// 既知の不具合（下のrenderPageToCanvasのコメント参照）を再発させかねないうえ、
+// メモリ割り当てもバースト的に増える。先頭から少数ずつ「窓」をずらしながら描画する。
+const PRINT_RENDER_WINDOW = 4;
+// 印刷準備が窓の中で一定時間まったく進まない場合、その窓内の未報告ページを
+// 「失敗」として扱い次へ進める（1ページの不具合が印刷準備全体を止めないように）。
+const PRINT_PAGE_STALL_MS = 15_000;
+// 印刷時、1ページを収めたい目標サイズ（CSS px, 96dpi換算）。A4は794×1123px、
+// globals.cssの `@page { margin: 10mm }` で四辺約38pxを引いた印字可能領域は
+// およそ718×1047px。できるだけ用紙いっぱいに使うため、丸め誤差ぶんだけ
+// 少し余裕を持たせた値にする（Letterは794より少し幅広・低めなのでこの値なら
+// 両方収まる）。内容が横長のページはglobals.cssの`.print-landscape`で用紙自体を
+// 横向きに切り替える（page: print-landscape）ため、縦横を入れ替えた値を使う。
+const PRINT_PAGE_BOX_PORTRAIT = { width: 716, height: 1045 };
+const PRINT_PAGE_BOX_LANDSCAPE = { width: 1045, height: 716 };
 
 // pdfjsのpage.render()は、ページの内容（CCITT/JBIG2等の圧縮フォーマットや解像度の組み合わせ）
 // によっては、canvasやページ番号に関係なくPromiseが解決も拒否もされず無期限に応答しなくなる
@@ -139,6 +163,8 @@ export default function PdfOverlayViewer({
   processingEnabled,
   onPageProgress,
   refiningIds,
+  forceRenderAll,
+  onAllPagesRendered,
 }: Props) {
   const pdfjsRef = useRef<typeof PdfjsNS | null>(null);
   // 効果（effect）・コールバック内部からの参照用。refなのでレンダー中には読まない
@@ -153,6 +179,14 @@ export default function PdfOverlayViewer({
   // ドキュメントを2回読み込み、描画対象を完全に分離することで回避する。
   const ocrPagesRef = useRef<PDFPageProxy[]>([]);
   const [numPages, setNumPages] = useState(0);
+  // forceRenderAll中に描画が確定した（成功/失敗いずれも）ページ番号の集合。
+  // 「PDFとして保存」の準備で全ページ処理済みかどうかを判定するために使う
+  // （render中に参照するのでref）。
+  const printSettledRef = useRef<Set<number>>(new Set());
+  // このページ番号以下を強制描画する（印刷準備の「窓」）。0なら強制描画しない。
+  // 全ページ同時に強制描画すると、同一ドキュメントへの同時render()でpdfjsが
+  // 無応答になる既知の不具合を再発させかねないため、少数ずつ順に進める。
+  const [printCursor, setPrintCursor] = useState(0);
   const [pageViewportSizes, setPageViewportSizes] = useState<
     { width: number; height: number }[]
   >([]);
@@ -598,6 +632,52 @@ export default function PdfOverlayViewer({
     [sourceLang, onManualRegion]
   );
 
+  // forceRenderAllがfalse→trueになったら印刷準備を開始する。前回の完了記録をクリアし、
+  // 先頭ページから窓ぶんだけ強制描画を始める。falseに戻ったら窓を閉じる。
+  // printSettledRef/printCursorは「propの値から毎回導出できる値」ではなく、
+  // このあとhandlePageRenderedが時間をかけて積み上げていく内部状態なので、
+  // レンダー中に計算せずeffectで初期化するのが適切
+  // （render中のref読み書きはreact-hooks/refsが禁止しており使えない）。
+  // 子（PdfPageView）のeffectは親より後にコミットされるため、この時点ではまだ
+  // どの子も新しいforceRenderを受け取っていない — 次のコミットで初めて窓が動き出す
+  // （printCursorをここで直接進めても「クリアする前に子が書き込む」競合は起きない）。
+  useEffect(() => {
+    printSettledRef.current = new Set();
+    // forceRenderAllの変化に追従して窓の起点をリセットする処理そのものであり、
+    // レンダー中に計算できる派生値ではない（上記コメント参照）。
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPrintCursor(forceRenderAll ? Math.min(numPages, PRINT_RENDER_WINDOW) : 0);
+  }, [forceRenderAll, numPages]);
+
+  // 子から「このページの描画が確定した（成功/失敗）」通知を受け、窓を先へずらす。
+  const handlePageRendered = useCallback(
+    (n: number, ok: boolean) => {
+      if (!forceRenderAll) return;
+      void ok; // 失敗ページも「これ以上待たない」という意味で処理済み扱いにする。
+      const settled = printSettledRef.current;
+      if (settled.has(n)) return; // 「既に描画済み」通知との重複を無視（冪等）。
+      settled.add(n);
+      setPrintCursor((c) => Math.min(numPages, Math.max(c, settled.size + PRINT_RENDER_WINDOW)));
+      if (settled.size >= numPages) onAllPagesRendered?.();
+    },
+    [forceRenderAll, numPages, onAllPagesRendered]
+  );
+
+  // 窓の中のページが一定時間まったく進まない場合（pdfjsのrender()が解決も拒否も
+  // しなくなる既知の不具合等）、その窓内の未報告ページを強制的に「処理済み」として
+  // 数え、次の窓へ進める。1ページの不具合で印刷準備全体が止まらないようにするため。
+  useEffect(() => {
+    if (!forceRenderAll || printCursor === 0 || numPages === 0) return;
+    if (printSettledRef.current.size >= numPages) return;
+    const timer = setTimeout(() => {
+      const settled = printSettledRef.current;
+      for (let n = 1; n <= printCursor; n++) settled.add(n);
+      setPrintCursor(Math.min(numPages, Math.max(printCursor, settled.size + PRINT_RENDER_WINDOW)));
+      if (settled.size >= numPages) onAllPagesRendered?.();
+    }, PRINT_PAGE_STALL_MS);
+    return () => clearTimeout(timer);
+  }, [forceRenderAll, printCursor, numPages, onAllPagesRendered]);
+
   // 文書内で最も多いページ幅（＝この文書における「普通の」ページ幅）。
   // 90/270°回転補正で幅高が入れ替わったページだけでなく、PDF自体がもともと横長
   // （日本語文書の間に挟まる横長の別紙等）で他ページより幅広いページも、この基準幅に
@@ -638,7 +718,10 @@ export default function PdfOverlayViewer({
   }
 
   return (
-    <div className="flex w-full flex-col gap-10">
+    // 印刷時はflexをやめてブロックフローに戻す。Chromeはフレックスコンテナの
+    // フラグメンテーション（改ページ）の扱いが不安定で、子のbreak-after:pageが
+    // 期待通りに効かないことがあるため。gap-10も印刷では不要（print:gap-0）。
+    <div className="flex w-full flex-col gap-10 print:block print:gap-0">
       {Array.from({ length: numPages }, (_, i) => i + 1).map((n) => {
         // ensurePageRotationが検出した補正量（PDFの/Rotateとは別物）を絶対角に変換して渡す。
         // 未検出または0°ならundefined（PdfPageView側もpdfjs既定=page.rotateで描画する）。
@@ -655,6 +738,19 @@ export default function PdfOverlayViewer({
           currentSize.width > referenceWidth && referenceWidth > 0
             ? referenceWidth / currentSize.width
             : 1;
+        // 印刷時は画面のズーム倍率ではなく、用紙1枚にできるだけ大きく収まる倍率へ
+        // 強制的に切り替える。印刷時のレイアウト幅は用紙の印字可能幅までしかない
+        // ため、SCALE=1.5で約900px幅のページを画面のズーム倍率のまま出すと横が
+        // 切れる。内容が横長のページはglobals.cssの`.print-landscape`で用紙自体を
+        // 横向きに切り替えるので、目標サイズも縦横を入れ替えたものを使う
+        // （そうしないと横長ページが縦向きの狭い用紙基準で不必要に縮小されてしまう）。
+        const isLandscapePage = currentSize.width > currentSize.height;
+        const printBox = isLandscapePage ? PRINT_PAGE_BOX_LANDSCAPE : PRINT_PAGE_BOX_PORTRAIT;
+        const printZoom =
+          currentSize.width > 0 && currentSize.height > 0
+            ? Math.min(1, printBox.width / currentSize.width, printBox.height / currentSize.height)
+            : 1;
+        const effectiveZoom = forceRenderAll ? printZoom : zoom * fitScale;
         return (
           // ページ単位で横スクロールできる領域にする。1つの巨大なスクロール領域を
           // 全ページで共有すると、横にはみ出すページの横スクロールバーが文書の
@@ -668,8 +764,19 @@ export default function PdfOverlayViewer({
           // はみ出す形で配置されているため、そのままだと上端がクリップされて
           // 見えなくなる。pt-6（24px）で内側を24px分下げ、バッジの実効位置を
           // クリップ領域の内側（y=0以上）に収める。
-          <div key={n} className="w-full overflow-x-auto pt-6">
-            <div className="flex" style={{ justifyContent: "safe center" }}>
+          //
+          // 印刷時: overflowをvisibleに戻す（overflow:auto等はフラグメンテーション
+          // 不可＝改ページできないため）。バッジはprint:hiddenで消すのでpt-6の
+          // 余白は print:pt-0 で回収する。1PDFページ=1印刷ページにするが、
+          // 最終ページにbreak-afterを付けると末尾に白紙が1枚出るブラウザがあるため
+          // 最後だけ付けない。
+          <div
+            key={n}
+            className={`w-full overflow-x-auto pt-6 print:overflow-visible print:pt-0 print:break-inside-avoid ${
+              n < numPages ? "print:break-after-page" : ""
+            } ${isLandscapePage ? "print-landscape" : ""}`}
+          >
+            <div className="flex justify-center-safe">
               <PdfPageView
                 page={pagesState[n - 1] as unknown as RenderablePage}
                 pageIndex={n}
@@ -678,7 +785,7 @@ export default function PdfOverlayViewer({
                 rotation={rotation}
                 rotationCorrected={!!rotationDelta}
                 viewportSize={currentSize}
-                zoom={zoom * fitScale}
+                zoom={effectiveZoom}
                 groups={pageGroups[n] ?? []}
                 manualGroups={manualGroups}
                 translations={translations}
@@ -693,6 +800,8 @@ export default function PdfOverlayViewer({
                 regionOcrRunning={regionOcr?.pageIndex === n}
                 regionError={regionError?.pageIndex === n ? regionError.message : null}
                 refiningIds={refiningIds}
+                forceRender={printCursor >= n}
+                onRendered={handlePageRendered}
               />
             </div>
           </div>
