@@ -34,6 +34,9 @@ export default function PdfTranslatorApp() {
   const [fileName, setFileName] = useState<string | null>(null);
   const [translations, setTranslations] = useState<Record<string, TranslationEntry>>({});
   const [showTranslation, setShowTranslation] = useState(true);
+  // 「文脈を踏まえて全体を再翻訳」（パス2）で差分がある訳文について、文書全体で
+  // 旧訳（パス1時点の訳）を表示するモードかどうか。←/→キーで全体切替する。
+  const [showOriginalTranslation, setShowOriginalTranslation] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   // 「PDFとして保存」の準備状態。trueの間、Viewerに全ページの強制描画を指示する。
   const [forceRenderAll, setForceRenderAll] = useState(false);
@@ -143,6 +146,7 @@ export default function PdfTranslatorApp() {
     setLangOverride(null);
     setDetectedLang(null);
     setOcrConfidence(null);
+    setShowOriginalTranslation(false);
   }, []);
 
   const zoomIn = useCallback(() => {
@@ -173,6 +177,7 @@ export default function PdfTranslatorApp() {
     printFiredRef.current = false;
     setSelectionMode(false);
     setShowTranslation(true);
+    setShowOriginalTranslation(false);
     setPrintPreparing(true);
     setForceRenderAll(true);
   }, []);
@@ -437,12 +442,14 @@ export default function PdfTranslatorApp() {
   }, [extractedGroups, manualGroups, dismissedIds, translations, sourceLang]);
 
   // Spaceキーで日本語オーバーレイの表示/非表示を切り替える。
-  // フォーム要素にフォーカスがある間はSpaceキー本来の挙動（ボタン押下・チェック等）を優先し、
-  // それ以外の場合のみページスクロールを止めてトグルする。
+  // ←/→キーは、文脈適応翻訳（パス2）で差分がある訳文について、文書全体で
+  // 旧訳（←）/再翻訳後（→）を切り替える。
+  // フォーム要素にフォーカスがある間は各キー本来の挙動（ボタン押下・チェック・
+  // セレクト操作等）を優先し、それ以外の場合のみページスクロールを止めて切り替える。
   useEffect(() => {
     if (!data) return;
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.code !== "Space") return;
+      if (e.code !== "Space" && e.code !== "ArrowLeft" && e.code !== "ArrowRight") return;
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       if (
@@ -455,7 +462,11 @@ export default function PdfTranslatorApp() {
         return;
       }
       e.preventDefault();
-      setShowTranslation((v) => !v);
+      if (e.code === "Space") {
+        setShowTranslation((v) => !v);
+      } else {
+        setShowOriginalTranslation(e.code === "ArrowLeft");
+      }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
@@ -548,6 +559,7 @@ export default function PdfTranslatorApp() {
     setRefineError(null);
     setRefiningIds(new Set());
     setErrorMessage(null);
+    setShowOriginalTranslation(false);
   }, []);
 
   return (
@@ -800,6 +812,12 @@ export default function PdfTranslatorApp() {
               <span className="font-semibold text-red-600">あ</span>
               文脈を踏まえて再翻訳された訳文
             </span>
+            {refineStatus === "done" && (
+              <span className="flex items-center gap-1.5">
+                ←/→キーで全体を旧訳/再翻訳後に切替（現在:{" "}
+                {showOriginalTranslation ? "旧訳を表示中" : "再翻訳後を表示中"}）
+              </span>
+            )}
             <span className="flex items-center gap-1.5">
               <span
                 className="inline-block h-3 w-3 rounded-sm border-2 border-[#a855f7]"
@@ -818,6 +836,7 @@ export default function PdfTranslatorApp() {
             data={data}
             translations={translations}
             showTranslation={showTranslation}
+            showOriginalTranslation={showOriginalTranslation}
             zoom={zoom}
             onExtracted={handleExtracted}
             sourceLang={sourceLang}

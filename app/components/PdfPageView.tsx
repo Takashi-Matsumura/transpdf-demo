@@ -49,6 +49,8 @@ type Props = {
   manualGroups: LineGroup[];
   translations: Record<string, TranslationEntry>;
   showTranslation: boolean;
+  /** 文書全体で「旧訳（パス1時点の訳）」を表示するモードかどうか（←/→キーで全体切替）。 */
+  showOriginalTranslation: boolean;
   dismissedIds: Set<string>;
   onRetranslate: (group: LineGroup) => void;
   onDismiss: (id: string) => void;
@@ -141,6 +143,7 @@ export default function PdfPageView({
   manualGroups,
   translations,
   showTranslation,
+  showOriginalTranslation,
   dismissedIds,
   onRetranslate,
   onDismiss,
@@ -369,6 +372,7 @@ export default function PdfPageView({
               onRetranslate={onRetranslate}
               onDismiss={onDismiss}
               refining={refiningIds.has(g.id)}
+              showOriginalTranslation={showOriginalTranslation}
             />
           ))}
         </div>
@@ -413,6 +417,7 @@ function OverlayItem({
   onRetranslate,
   onDismiss,
   refining,
+  showOriginalTranslation,
 }: {
   group: LineGroup;
   translation: TranslationEntry | undefined;
@@ -420,6 +425,11 @@ function OverlayItem({
   onDismiss: (id: string) => void;
   /** 「文脈を踏まえて全体を再翻訳」で、今まさにLLMへ送られている最中かどうか。 */
   refining: boolean;
+  /**
+   * 文書全体で「旧訳（パス1時点の訳）」を表示するモードかどうか（←/→キーで全体切替）。
+   * このボックスに実際の差分がある場合だけ効果を持つ。
+   */
+  showOriginalTranslation: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [scaleX, setScaleX] = useState(1);
@@ -436,6 +446,10 @@ function OverlayItem({
     refined && translation?.previousText && translation.previousText !== text
       ? diffChars(translation.previousText, text)
       : null;
+  // 旧訳と切り替えて見比べられるのは、実際に差分がある場合だけ。
+  const hasDiff = diffSegments !== null;
+  const showOriginal = hasDiff && showOriginalTranslation;
+  const displayText = showOriginal ? (translation?.previousText ?? text) : text;
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -445,7 +459,7 @@ function OverlayItem({
     if (raw > group.box.width && raw > 0) {
       setScaleX(Math.max(group.box.width / raw, 0.4));
     }
-  }, [text, group.box.width]);
+  }, [displayText, group.box.width]);
 
   const { box } = group;
   const fontSize = Math.max(box.height * 0.85, 8);
@@ -473,9 +487,11 @@ function OverlayItem({
             ? "ローカルLLMからの応答が得られなかったため原文を表示しています（ホバーで再翻訳・削除）"
             : loading
               ? "翻訳待ちです"
-              : refined
-                ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示・ホバーで再翻訳・削除）"
-                : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
+              : hasDiff
+                ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示）。←/→キーで旧訳/再翻訳後を全体切替できます（ホバーで再翻訳・削除）"
+                : refined
+                  ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示・ホバーで再翻訳・削除）"
+                  : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
       }
       style={{
         position: "absolute",
@@ -511,9 +527,10 @@ function OverlayItem({
           transformOrigin: "left top",
         }}
       >
-        {diffSegments
+        {diffSegments && !showOriginal
           ? // 文脈適応翻訳（パス2）で実際に変わった区間だけ赤字にする。
-            // 変わっていない区間はそのまま黒字（旧訳と同じ）。
+            // 変わっていない区間はそのまま黒字（旧訳と同じ）。←/→キーで全体が
+            // 旧訳表示モードのときは旧訳(previousText)をそのまま黒字で表示する。
             diffSegments.map((seg, i) => (
               <span
                 key={i}
@@ -526,8 +543,16 @@ function OverlayItem({
                 {seg.text}
               </span>
             ))
-          : text}
+          : displayText}
       </div>
+      {showOriginal && (
+        <div
+          className="absolute -top-2.5 -left-2.5 z-30 whitespace-nowrap rounded-full border px-1.5 text-[9px] font-medium leading-[14px] shadow print:hidden"
+          style={{ background: "#f3f4f6", borderColor: "#9ca3af", color: "#374151" }}
+        >
+          旧訳
+        </div>
+      )}
       {!loading && hovered && (
         <div
           className="absolute -top-2.5 -right-2.5 z-30 flex gap-1 print:hidden"
