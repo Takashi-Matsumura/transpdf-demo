@@ -15,6 +15,8 @@ type Props = {
   translations: Record<string, TranslationEntry>;
   /** trueなら日本語オーバーレイを表示、falseなら原文のまま */
   showTranslation: boolean;
+  /** 文書全体で「旧訳（パス1時点の訳）」を表示するモードかどうか（←/→キーで全体切替）。 */
+  showOriginalTranslation: boolean;
   /** 表示倍率。1 が等倍。 */
   zoom: number;
   /**
@@ -149,6 +151,7 @@ export default function PdfOverlayViewer({
   data,
   translations,
   showTranslation,
+  showOriginalTranslation,
   zoom,
   onExtracted,
   sourceLang,
@@ -790,6 +793,7 @@ export default function PdfOverlayViewer({
                 manualGroups={manualGroups}
                 translations={translations}
                 showTranslation={showTranslation}
+                showOriginalTranslation={showOriginalTranslation}
                 dismissedIds={dismissedIds}
                 onRetranslate={onRetranslate}
                 onDismiss={onDismiss}

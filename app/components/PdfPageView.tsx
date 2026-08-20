@@ -49,6 +49,8 @@ type Props = {
   manualGroups: LineGroup[];
   translations: Record<string, TranslationEntry>;
   showTranslation: boolean;
+  /** 文書全体で「旧訳（パス1時点の訳）」を表示するモードかどうか（←/→キーで全体切替）。 */
+  showOriginalTranslation: boolean;
   dismissedIds: Set<string>;
   onRetranslate: (group: LineGroup) => void;
   onDismiss: (id: string) => void;
@@ -141,6 +143,7 @@ export default function PdfPageView({
   manualGroups,
   translations,
   showTranslation,
+  showOriginalTranslation,
   dismissedIds,
   onRetranslate,
   onDismiss,
@@ -369,6 +372,7 @@ export default function PdfPageView({
               onRetranslate={onRetranslate}
               onDismiss={onDismiss}
               refining={refiningIds.has(g.id)}
+              showOriginalTranslation={showOriginalTranslation}
             />
           ))}
         </div>
@@ -413,6 +417,7 @@ function OverlayItem({
   onRetranslate,
   onDismiss,
   refining,
+  showOriginalTranslation,
 }: {
   group: LineGroup;
   translation: TranslationEntry | undefined;
@@ -420,13 +425,15 @@ function OverlayItem({
   onDismiss: (id: string) => void;
   /** 「文脈を踏まえて全体を再翻訳」で、今まさにLLMへ送られている最中かどうか。 */
   refining: boolean;
+  /**
+   * 文書全体で「旧訳（パス1時点の訳）」を表示するモードかどうか（←/→キーで全体切替）。
+   * このボックスに実際の差分がある場合だけ効果を持つ。
+   */
+  showOriginalTranslation: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [scaleX, setScaleX] = useState(1);
   const [hovered, setHovered] = useState(false);
-  // ホバー中、ボックス内でカーソルが左半分/右半分どちらにあるかで
-  // 「再翻訳前(旧訳)」「再翻訳後」を切り替えて見せるためのフラグ。
-  const [showOriginal, setShowOriginal] = useState(false);
   const text = translation?.text ?? group.text;
   const loading = translation === undefined;
   const failed = translation?.failed ?? false;
@@ -441,15 +448,8 @@ function OverlayItem({
       : null;
   // 旧訳と切り替えて見比べられるのは、実際に差分がある場合だけ。
   const hasDiff = diffSegments !== null;
-  const displayText = hasDiff && showOriginal ? (translation?.previousText ?? text) : text;
-
-  // 再翻訳などでtextが変わったら、常に「再翻訳後」表示へ戻す
-  // （レンダー中に直接調整する。effect経由だと1フレーム分旧表示のままになるため）。
-  const prevTextRef = useRef(text);
-  if (prevTextRef.current !== text) {
-    prevTextRef.current = text;
-    if (showOriginal) setShowOriginal(false);
-  }
+  const showOriginal = hasDiff && showOriginalTranslation;
+  const displayText = showOriginal ? (translation?.previousText ?? text) : text;
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -460,16 +460,6 @@ function OverlayItem({
       setScaleX(Math.max(group.box.width / raw, 0.4));
     }
   }, [displayText, group.box.width]);
-
-  // ホバー中のカーソルX位置がボックスの左半分/右半分どちらにあるかで
-  // showOriginalを切り替える（左=旧訳、右=再翻訳後）。
-  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!hasDiff) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width === 0) return;
-    const ratio = (e.clientX - rect.left) / rect.width;
-    setShowOriginal(ratio < 0.5);
-  };
 
   const { box } = group;
   const fontSize = Math.max(box.height * 0.85, 8);
@@ -489,11 +479,7 @@ function OverlayItem({
   return (
     <div
       onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => {
-        setHovered(false);
-        setShowOriginal(false);
-      }}
-      onMouseMove={handleMouseMove}
+      onMouseLeave={() => setHovered(false)}
       title={
         refining
           ? "文脈を踏まえて再翻訳中です…"
@@ -502,7 +488,7 @@ function OverlayItem({
             : loading
               ? "翻訳待ちです"
               : hasDiff
-                ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示）。カーソルを左半分/右半分に動かすと旧訳/再翻訳後を切り替えられます（ホバーで再翻訳・削除）"
+                ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示）。←/→キーで旧訳/再翻訳後を全体切替できます（ホバーで再翻訳・削除）"
                 : refined
                   ? "文脈を踏まえて全体を再翻訳した結果です（赤字表示・ホバーで再翻訳・削除）"
                   : "ローカルLLMによる翻訳です（ホバーで再翻訳・削除）"
@@ -543,8 +529,8 @@ function OverlayItem({
       >
         {diffSegments && !showOriginal
           ? // 文脈適応翻訳（パス2）で実際に変わった区間だけ赤字にする。
-            // 変わっていない区間はそのまま黒字（旧訳と同じ）。カーソルが左半分に
-            // あるときは旧訳(previousText)をそのまま黒字で表示する。
+            // 変わっていない区間はそのまま黒字（旧訳と同じ）。←/→キーで全体が
+            // 旧訳表示モードのときは旧訳(previousText)をそのまま黒字で表示する。
             diffSegments.map((seg, i) => (
               <span
                 key={i}
@@ -559,16 +545,12 @@ function OverlayItem({
             ))
           : displayText}
       </div>
-      {hasDiff && hovered && (
+      {showOriginal && (
         <div
           className="absolute -top-2.5 -left-2.5 z-30 whitespace-nowrap rounded-full border px-1.5 text-[9px] font-medium leading-[14px] shadow print:hidden"
-          style={
-            showOriginal
-              ? { background: "#f3f4f6", borderColor: "#9ca3af", color: "#374151" }
-              : { background: "#fee2e2", borderColor: "#dc2626", color: "#dc2626" }
-          }
+          style={{ background: "#f3f4f6", borderColor: "#9ca3af", color: "#374151" }}
         >
-          {showOriginal ? "旧訳" : "再翻訳後"}
+          旧訳
         </div>
       )}
       {!loading && hovered && (
